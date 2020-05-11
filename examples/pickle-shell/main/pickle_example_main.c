@@ -8,22 +8,26 @@
 */
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
 #include "assert.h"
 #include "driver/uart.h"
 #include "errno.h"
 #include "esp_console.h"
 #include "esp_log.h"
+#include "esp_wifi.h"
 #include "esp_spi_flash.h"
 #include "esp_system.h"
 #include "esp_vfs_dev.h"
 #include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "linenoise/linenoise.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "pickle.h"
 #include "sdkconfig.h"
+#include "esp_event.h"
 
 #define UNUSED(X) ((void)(X))
 #define EOL "\r\n"
@@ -169,6 +173,81 @@ static int commandSource(pickle_t *i, int argc, char **argv, void *pd) {
 	return r;
 }
 
+/* ======================= WiFi ======================= */
+#define JOIN_TIMEOUT_MS (10000)
+
+static EventGroupHandle_t wifi_event_group;
+const int CONNECTED_BIT = BIT0;
+
+static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+	if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+		esp_wifi_connect();
+		xEventGroupClearBits(wifi_event_group, CONNECTED_BIT);
+	} else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+		xEventGroupSetBits(wifi_event_group, CONNECTED_BIT);
+	}
+}
+
+static void initialise_wifi(void) {
+	esp_log_level_set("wifi", ESP_LOG_WARN);
+	static bool initialized = false;
+	if (initialized) {
+		return;
+	}
+	ESP_ERROR_CHECK(esp_netif_init());
+	wifi_event_group = xEventGroupCreate();
+	ESP_ERROR_CHECK(esp_event_loop_create_default());
+	esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();
+	assert(ap_netif);
+	esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+	assert(sta_netif);
+	wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+	ESP_ERROR_CHECK( esp_wifi_init(&cfg) );
+	ESP_ERROR_CHECK( esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &event_handler, NULL) );
+	ESP_ERROR_CHECK( esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL) );
+	ESP_ERROR_CHECK( esp_wifi_set_storage(WIFI_STORAGE_RAM) );
+	ESP_ERROR_CHECK( esp_wifi_set_mode(WIFI_MODE_NULL) );
+	ESP_ERROR_CHECK( esp_wifi_start() );
+	initialized = true;
+}
+
+static bool wifi_join(const char *ssid, const char *pass, int timeout_ms) {
+	initialise_wifi();
+	wifi_config_t wifi_config = { 0 };
+	strlcpy((char *) wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
+	if (pass) {
+		strlcpy((char *) wifi_config.sta.password, pass, sizeof(wifi_config.sta.password));
+	}
+
+	ESP_ERROR_CHECK( esp_wifi_set_mode(WIFI_MODE_STA) );
+	ESP_ERROR_CHECK( esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config) );
+	ESP_ERROR_CHECK( esp_wifi_connect() );
+
+	int bits = xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT, pdFALSE, pdTRUE, timeout_ms / portTICK_PERIOD_MS);
+	return (bits & CONNECTED_BIT) != 0;
+}
+
+static int commandWiFi(pickle_t *i, int argc, char **argv, void *pd) {
+	if (argc != 2 && argc != 3 && argc != 4)
+		return pickle_set_result_error_arity(i, 3, argc, argv);
+
+	int timeout_ms = 10000;
+	if (argc == 4) {
+		sscanf(argv[3], "%d", &timeout_ms);
+	}
+
+	char *ssid = argv[1];
+	char *password = argc >= 3 ? argv[2] : "";
+	printf("ssid(%s), password(%s), timeout(%d)" EOL, ssid, password, timeout_ms);
+	const int connected = wifi_join(ssid, password, timeout_ms);
+	if (!connected)
+		return pickle_set_result_error(i, "WiFi timeout");
+	return pickle_set_result(i, "Connected");
+}
+
+/* ======================= WiFi ======================= */
+
+
 static int make_a_pickle(pickle_t **ret, FILE *in, FILE *out) {
 	assert(ret);
 	assert(in);
@@ -189,6 +268,7 @@ static int make_a_pickle(pickle_t **ret, FILE *in, FILE *out) {
 		{ "getenv", commandGetEnv, NULL   },
 		{ "exit",   commandExit,   NULL   },
 		{ "source", commandSource, NULL   },
+		{ "wifi",   commandWiFi, NULL   },
 		//{ "system", commandConsole, NULL   },
 	};
 
@@ -301,7 +381,7 @@ fail:
 	return -1;
 }
 
-/*static void initialize_nvs(void)
+static void initialize_nvs(void)
 {
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -309,11 +389,11 @@ fail:
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
-}*/
+}
 
 void app_main(void)
 {
-    //initialize_nvs();
+    initialize_nvs();
     printf("Pickle Shell: How do you like those pickles?\n");
 
     pickle_shell();
