@@ -32,6 +32,8 @@
 #define UNUSED(X) ((void)(X))
 #define EOL "\r\n"
 
+static const char *TAG = "pickle";
+
 static void *allocator(void *arena, void *ptr, const size_t oldsz, const size_t newsz) {
 	UNUSED(arena);
 	if (newsz == 0) { free(ptr); return NULL; }
@@ -173,11 +175,46 @@ static int commandSource(pickle_t *i, int argc, char **argv, void *pd) {
 	return r;
 }
 
+static int convert(pickle_t *i, const char *s, int *d) {
+	assert(i);
+	assert(d);
+	if (sscanf(s, "%d", d) != 1)
+		return pickle_set_result_error(i, "Invalid number %s", d);
+	return PICKLE_OK;
+}
+
 /* ======================= WiFi ======================= */
 #define JOIN_TIMEOUT_MS (10000)
 
 static EventGroupHandle_t wifi_event_group;
 const int CONNECTED_BIT = BIT0;
+
+//#define DEFAULT_SCAN_LIST_SIZE CONFIG_EXAMPLE_SCAN_LIST_SIZE
+#define DEFAULT_SCAN_LIST_SIZE (8u)
+
+static const char *auth(const int mode) {
+	switch (mode) {
+	case  WIFI_AUTH_OPEN:             return  "OPEN";
+	case  WIFI_AUTH_WEP:              return  "WEP";
+	case  WIFI_AUTH_WPA_PSK:          return  "WPA_PSK";
+	case  WIFI_AUTH_WPA2_PSK:         return  "WPA2_PSK";
+	case  WIFI_AUTH_WPA_WPA2_PSK:     return  "WPA_WPA2_PSK";
+	case  WIFI_AUTH_WPA2_ENTERPRISE:  return  "WPA2_ENTERPRISE";
+	}
+	return "unknown";
+}
+
+static const char *cipher(const int type) {
+	switch (type) {
+	case WIFI_CIPHER_TYPE_NONE: return "NONE";
+	case WIFI_CIPHER_TYPE_WEP40: return "WEP40";
+	case WIFI_CIPHER_TYPE_WEP104: return "WEP104";
+	case WIFI_CIPHER_TYPE_TKIP: return "TKIP";
+	case WIFI_CIPHER_TYPE_CCMP: return "CCMP";
+	case WIFI_CIPHER_TYPE_TKIP_CCMP: return "TKIP_CCMP";
+	}
+	return "UNKNOWN";
+}
 
 static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
 	if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
@@ -188,12 +225,11 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
 	}
 }
 
-static void initialise_wifi(void) {
-	esp_log_level_set("wifi", ESP_LOG_WARN);
+static void wifi_initialize(void) {
+	esp_log_level_set("wifi", ESP_LOG_ERROR);
 	static bool initialized = false;
-	if (initialized) {
+	if (initialized)
 		return;
-	}
 	ESP_ERROR_CHECK(esp_netif_init());
 	wifi_event_group = xEventGroupCreate();
 	ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -211,9 +247,76 @@ static void initialise_wifi(void) {
 	initialized = true;
 }
 
+static int commandWiFiScan(pickle_t *i, int argc, char **argv, void *pd) {
+	if (argc != 1)
+		return pickle_set_result_error_arity(i, 1, argc, argv);
+#if 0
+	ESP_ERROR_CHECK(esp_netif_init());
+	ESP_ERROR_CHECK(esp_event_loop_create_default());
+	esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+	assert(sta_netif);
+
+	wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+	ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+	ESP_ERROR_CHECK(esp_wifi_start());
+#else
+	wifi_initialize();
+	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+#endif
+	uint16_t number = DEFAULT_SCAN_LIST_SIZE;
+	wifi_ap_record_t ap_info[DEFAULT_SCAN_LIST_SIZE];
+	uint16_t ap_count = 0;
+	memset(ap_info, 0, sizeof(ap_info));
+
+#if 0
+	wifi_scan_config_t scan_config = {
+		.show_hidden = false,
+		.scan_type = WIFI_SCAN_TYPE_PASSIVE,
+		.scan_time = {
+			.active = 200,
+			.passive = 500,
+		},
+	};
+	ESP_ERROR_CHECK(esp_wifi_scan_start(&scan_config, true));
+#else
+	ESP_ERROR_CHECK(esp_wifi_scan_start(NULL, true));
+#endif
+	ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&number, ap_info));
+	ESP_ERROR_CHECK(esp_wifi_scan_get_ap_num(&ap_count));
+	ESP_LOGI(TAG, "Total APs scanned = %u", ap_count);
+	for (int i = 0; (i < DEFAULT_SCAN_LIST_SIZE) && (i < ap_count); i++) {
+		wifi_ap_record_t *rec = &ap_info[i];
+		ESP_LOGI(TAG, "SSID \t\t%s", rec->ssid);
+		ESP_LOGI(TAG, "RSSI \t\t%d", rec->rssi);
+		ESP_LOGI(TAG, "AUTH \t\t%s", auth(rec->authmode));
+		if (rec->authmode != WIFI_AUTH_WEP) {
+			ESP_LOGI(TAG, "Cipher(pairwise) \t\t%s", cipher(rec->pairwise_cipher));
+			ESP_LOGI(TAG, "Cipher(group)    \t\t%s", cipher(rec->group_cipher));
+		}
+		ESP_LOGI(TAG, "Channel \t\t%d\n", rec->primary);
+	}
+	return PICKLE_OK;
+}
+
+static int commandWiFiStatus(pickle_t *i, int argc, char **argv, void *pd) {
+	/* TODO: Read connect/scanning/station/AP/disconnect, and other WiFi information */
+	return PICKLE_OK;
+}
+
+static int commandWiFiDisconnect(pickle_t *i, int argc, char **argv, void *pd) {
+	if (argc != 1)
+		return pickle_set_result_error_arity(i, 1, argc, argv);
+	esp_wifi_disconnect();
+	return PICKLE_OK;
+}
+
 static bool wifi_join(const char *ssid, const char *pass, int timeout_ms) {
-	initialise_wifi();
+	wifi_initialize();
 	wifi_config_t wifi_config = { 0 };
+	/* Note: we can also set the BSSID and Channel (if known) as part of
+	 * the 'sta' structure. */
 	strlcpy((char *) wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
 	if (pass) {
 		strlcpy((char *) wifi_config.sta.password, pass, sizeof(wifi_config.sta.password));
@@ -223,17 +326,19 @@ static bool wifi_join(const char *ssid, const char *pass, int timeout_ms) {
 	ESP_ERROR_CHECK( esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config) );
 	ESP_ERROR_CHECK( esp_wifi_connect() );
 
-	int bits = xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT, pdFALSE, pdTRUE, timeout_ms / portTICK_PERIOD_MS);
+	const int bits = xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT, pdFALSE, pdTRUE, timeout_ms / portTICK_PERIOD_MS);
 	return (bits & CONNECTED_BIT) != 0;
 }
 
-static int commandWiFi(pickle_t *i, int argc, char **argv, void *pd) {
+static int commandWiFiJoin(pickle_t *i, int argc, char **argv, void *pd) {
 	if (argc != 2 && argc != 3 && argc != 4)
 		return pickle_set_result_error_arity(i, 3, argc, argv);
 
 	int timeout_ms = 10000;
 	if (argc == 4) {
 		sscanf(argv[3], "%d", &timeout_ms);
+		if (convert(i, argv[3], &timeout_ms) != PICKLE_OK)
+			return PICKLE_ERROR;
 	}
 
 	char *ssid = argv[1];
@@ -245,8 +350,62 @@ static int commandWiFi(pickle_t *i, int argc, char **argv, void *pd) {
 	return pickle_set_result(i, "Connected");
 }
 
+static int commandWiFi(pickle_t *i, int argc, char **argv, void *pd) {
+	if (argc < 2)
+		return pickle_set_result_error_arity(i, 3, argc, argv);
+	if (!strcmp(argv[1], "status"))
+		return commandWiFiStatus(i, argc - 1, argv + 1, pd);
+	if (!strcmp(argv[1], "join") || !strcmp(argv[1], "connect"))
+		return commandWiFiJoin(i, argc - 1, argv + 1, pd);
+	if (!strcmp(argv[1], "disconnect"))
+		return commandWiFiDisconnect(i, argc - 1, argv + 1, pd);
+	//if (!strcmp(argv[1], "wps"))
+	//	return commandWiFiWPS(i, argc - 1, argv + 1, pd);
+	if (!strcmp(argv[1], "scan"))
+		return commandWiFiScan(i, argc - 1, argv + 1, pd);
+	return pickle_set_result_error(i, "Invalid subcommand %s", argv[1]);
+}
+
 /* ======================= WiFi ======================= */
 
+/* ======================= Logging ==================== */
+
+static int logging_level(const char *l, esp_log_level_t *e) {
+	assert(l);
+	assert(e);
+
+	struct logging_string {
+		char *name;
+		esp_log_level_t level;
+	} s[] = {
+		{ "none",    ESP_LOG_NONE, },
+		{ "error",   ESP_LOG_ERROR, },
+		{ "warn",    ESP_LOG_WARN, },
+		{ "warning", ESP_LOG_WARN, },
+		{ "debug",   ESP_LOG_DEBUG, },
+		{ "info",    ESP_LOG_INFO, },
+		{ "verbose", ESP_LOG_VERBOSE, },
+	};
+	*e = ESP_LOG_NONE;
+	for (size_t j = 0; j < (sizeof (s) / sizeof s[0]); j++)
+		if (!strcmp(l, s[j].name)) {
+			*e = s[j].level;
+			return 0;
+		}
+	return -1;
+}
+
+static int commandLogging(pickle_t *i, int argc, char **argv, void *pd) {
+	if (argc != 3)
+		return pickle_set_result_error_arity(i, 3, argc, argv);
+	esp_log_level_t level = ESP_LOG_NONE;
+	if (logging_level(argv[2], &level) < 0)
+		return pickle_set_result_error(i, "Invalid logging level %s", argv[1]);
+	esp_log_level_set(argv[1], ESP_LOG_ERROR);
+	return PICKLE_OK;
+}
+
+/* ======================= Logging ==================== */
 
 static int make_a_pickle(pickle_t **ret, FILE *in, FILE *out) {
 	assert(ret);
@@ -263,12 +422,13 @@ static int make_a_pickle(pickle_t **ret, FILE *in, FILE *out) {
 	} commands_t;
 
 	const commands_t cmds[] = {
-		{ "gets",   commandGets,   in     },
-		{ "puts",   commandPuts,   out    },
-		{ "getenv", commandGetEnv, NULL   },
-		{ "exit",   commandExit,   NULL   },
-		{ "source", commandSource, NULL   },
-		{ "wifi",   commandWiFi, NULL   },
+		{ "gets",    commandGets,      in     },
+		{ "puts",    commandPuts,      out    },
+		{ "getenv",  commandGetEnv,    NULL   },
+		{ "exit",    commandExit,      NULL   },
+		{ "source",  commandSource,    NULL   },
+		{ "wifi",    commandWiFi,      NULL   },
+		{ "logging", commandLogging,   NULL   },
 		//{ "system", commandConsole, NULL   },
 	};
 
@@ -284,6 +444,7 @@ fail:
 	return -1;
 }
 
+/* TODO: Handle dumb terminal like original console program */
 static void initialize_console(void) {
 	/* Drain stdout before reconfiguring it */
 	fflush(stdout);
