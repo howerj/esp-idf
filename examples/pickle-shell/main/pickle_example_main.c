@@ -1,14 +1,8 @@
-/* Hello World Example
-
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
-
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
+/* Pickle Shell: A TCL like language */
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <time.h>
 #include "assert.h"
 #include "driver/uart.h"
 #include "errno.h"
@@ -31,14 +25,39 @@
 
 #define UNUSED(X) ((void)(X))
 #define EOL "\r\n"
+#define ok(i, ...)    pickle_result_set(i, PICKLE_OK,    __VA_ARGS__)
+#define error(i, ...) pickle_result_set(i, PICKLE_ERROR, __VA_ARGS__)
 
 static const char *TAG = "pickle";
 
+/* NB. This allocator can be use to get memory statistics (printed atexit) or test allocation failures */
 static void *allocator(void *arena, void *ptr, const size_t oldsz, const size_t newsz) {
 	UNUSED(arena);
 	if (newsz == 0) { free(ptr); return NULL; }
 	if (newsz > oldsz) return realloc(ptr, newsz);
 	return ptr;
+}
+
+static int release(pickle_t *i, void *ptr) {
+	void *arena = NULL;
+	allocator_fn fn = NULL;
+	const int r1 = pickle_allocator_get(i, &fn, &arena);
+	if (fn)
+		fn(arena, ptr, 0, 0);
+	return fn ? r1 : PICKLE_ERROR;
+}
+
+static void *reallocator(pickle_t *i, void *ptr, size_t sz) {
+	void *arena = NULL;
+	allocator_fn fn = NULL;
+	if (pickle_allocator_get(i, &fn, &arena) != PICKLE_OK)
+		abort();
+	void *r = allocator(arena, ptr, 0, sz);
+	if (!r) {
+		release(i, ptr);
+		return NULL;
+	}
+	return r;
 }
 
 static char *slurp(pickle_t *i, FILE *input, size_t *length, char *class) {
@@ -48,7 +67,7 @@ static char *slurp(pickle_t *i, FILE *input, size_t *length, char *class) {
 	if (length)
 		*length = 0;
 	for (;;) {
-		if (pickle_reallocate(i, (void**)&m, sz + bsz + 1) != PICKLE_OK)
+		if ((m = reallocator(i, m, sz + bsz + 1)) == NULL)
 			return NULL;
 		if (class) {
 			size_t j = 0;
@@ -78,63 +97,97 @@ static char *slurp(pickle_t *i, FILE *input, size_t *length, char *class) {
 
 static int commandGets(pickle_t *i, int argc, char **argv, void *pd) {
 	if (argc != 1)
-		return pickle_set_result_error_arity(i, 1, argc, argv);
+		return error(i, "Invalid command %s", argv[0]);
 	size_t length = 0;
 	char *line = slurp(i, (FILE*)pd, &length, "\n");
 	if (!line)
-		return pickle_set_result_error(i, "Out Of Memory");
+		return error(i, "Out Of Memory");
 	if (!length) {
-		if (pickle_free(i, (void**)&line) != PICKLE_OK)
-			return PICKLE_ERROR;
-		if (pickle_set_result(i, "EOF") != PICKLE_OK)
+		release(i, line);
+		if (ok(i, "EOF") != PICKLE_OK)
 			return PICKLE_ERROR;
 		return PICKLE_BREAK;
 	}
-	const int r = pickle_set_result(i, line);
-	if (pickle_free(i, (void**)&line) != PICKLE_OK)
-		return PICKLE_ERROR;
+	const int r = ok(i, line);
+	release(i, line);
 	return r;
 }
 
 static int commandPuts(pickle_t *i, int argc, char **argv, void *pd) {
-	int r = PICKLE_OK;
 	FILE *out = pd;
 	if (argc != 1 && argc != 2 && argc != 3)
-		return pickle_set_result_error_arity(i, 2, argc, argv);
-	if (argc == 1) {
-		r = fputs(EOL, out) < 0 ? PICKLE_ERROR : PICKLE_OK;
-		goto flush;
-	}
-	if (argc == 2) {
-		r = fprintf(out, "%s" EOL, argv[1]) < 0 ? PICKLE_ERROR : PICKLE_OK;
-		goto flush;
-	}
-	if (!strcmp(argv[1], "-nonewline")) {
-		r = fputs(argv[2], out) < 0 ? PICKLE_ERROR : PICKLE_OK;
-		goto flush;
-	}
-	return pickle_set_result_error(i, "Invalid option %s", argv[1]);
-flush:
-	if (fflush(out) < 0)
-		return PICKLE_ERROR;
-	return r;
-}
-
-static int commandExit(pickle_t *i, int argc, char **argv, void *pd) {
-	UNUSED(pd);
-	if (argc != 2 && argc != 1)
-		return pickle_set_result_error_arity(i, 2, argc, argv);
-	const char *code = argc == 2 ? argv[1] : "0";
-	exit(atoi(code));
-	return PICKLE_OK;
+		return error(i, "Invalid command %s -nonewline? string?", argv[0]);
+	if (argc == 1)
+		return fputc('\n', out) < 0 ? PICKLE_ERROR : PICKLE_OK;
+	if (argc == 2)
+		return fprintf(out, "%s\n", argv[1]) < 0 ? PICKLE_ERROR : PICKLE_OK;
+	if (!strcmp(argv[1], "-nonewline"))
+		return fputs(argv[2], out) < 0 ? PICKLE_ERROR : PICKLE_OK;
+	return error(i, "Invalid option %s", argv[1]);
 }
 
 static int commandGetEnv(pickle_t *i, int argc, char **argv, void *pd) {
 	UNUSED(pd);
 	if (argc != 2)
-		return pickle_set_result_error_arity(i, 2, argc, argv);
+		return error(i, "Invalid command %s string", argv[0]);
 	const char *env = getenv(argv[1]);
-	return pickle_set_result_string(i, env ? env : "");
+	return ok(i, env ? env : "");
+}
+
+static int commandExit(pickle_t *i, int argc, char **argv, void *pd) {
+	UNUSED(pd);
+	if (argc != 2 && argc != 1)
+		return error(i, "Invalid command %s number?", argv[0]);
+	const char *code = argc == 2 ? argv[1] : "0";
+	exit(atoi(code));
+	return PICKLE_ERROR; /* unreachable */
+}
+
+static int commandClock(pickle_t *i, const int argc, char **argv, void *pd) {
+	UNUSED(pd);
+	time_t ts = 0;
+	if (argc < 2)
+		return error(i, "Invalid command %s subcommand...", argv[0]);
+	if (!strcmp(argv[1], "clicks")) {
+		const long t = (((double)(clock()) / (double)CLOCKS_PER_SEC) * 1000.0);
+		return ok(i, "%ld", t);
+	}
+	if (!strcmp(argv[1], "seconds"))
+		return ok(i, "%ld", (long)time(&ts));
+	if (!strcmp(argv[1], "format")) {
+		const int gmt = 1;
+		char buf[512] = { 0 };
+		char *fmt = argc == 4 ? argv[3] : "%a %b %d %H:%M:%S %Z %Y";
+		int tv = 0;
+		if (argc != 3 && argc != 4)
+			return error(i, "Invalid subcommand");
+		if (sscanf(argv[2], "%d", &tv) != 1)
+			return error(i, "Invalid number: %s", argv[2]);
+		ts = tv;
+		struct tm *timeinfo = (gmt ? gmtime : localtime)(&ts);
+		strftime(buf, sizeof buf, fmt, timeinfo);
+		return ok(i, "%s", buf);
+	}
+	return error(i, "Invalid command %s subcommand...", argv[0]);
+}
+
+static int commandSource(pickle_t *i, int argc, char **argv, void *pd) {
+	if (argc != 1 && argc != 2)
+		return error(i, "Invalid command %s string?", argv[0]);
+	errno = 0;
+	FILE *file = argc == 1 ? pd : fopen(argv[1], "rb");
+	if (!file)
+		return error(i, "Could not open file '%s' for reading: %s", argv[1], strerror(errno));
+
+	char *program = slurp(i, file, NULL, NULL);
+	if (file != pd)
+		fclose(file);
+	if (!program)
+		return error(i, "Out Of Memory");
+
+	const int r = pickle_eval(i, program);
+	release(i, program);
+	return r;
 }
 
 /*static int commandConsole(pickle_t *i, int argc, char **argv, void *pd) {
@@ -144,42 +197,22 @@ static int commandGetEnv(pickle_t *i, int argc, char **argv, void *pd) {
 	int ret = 0;
 	esp_err_t err = esp_console_run(argv[1], &ret);
 	if (err == ESP_ERR_NOT_FOUND) {
-        	return pickle_set_result(i, "Invalid command");
+        	return ok(i, "Invalid command");
         } else if (err == ESP_ERR_INVALID_ARG) {
         	// command was empty
         } else if (err == ESP_OK && ret != ESP_OK) {
-        	return pickle_set_result(i, "Command returned non-zero error code: 0x%x (%s)\n", ret, esp_err_to_name(ret));
+        	return ok(i, "Command returned non-zero error code: 0x%x (%s)\n", ret, esp_err_to_name(ret));
         } else if (err != ESP_OK) {
-		return pickle_set_result(i, "Invalid internal state: %s", esp_err_to_name(err));
+		return ok(i, "Invalid internal state: %s", esp_err_to_name(err));
         }
-	return pickle_set_result_string(i, "");
+	return ok(i, "");
 }*/
-
-static int commandSource(pickle_t *i, int argc, char **argv, void *pd) {
-	if (argc != 1 && argc != 2)
-		return pickle_set_result_error_arity(i, 2, argc, argv);
-	errno = 0;
-	FILE *file = argc == 1 ? pd : fopen(argv[1], "rb");
-	if (!file)
-		return pickle_set_result_error(i, "Could not open file '%s' for reading: %s", argv[1], strerror(errno));
-
-	char *program = slurp(i, file, NULL, NULL);
-	if (file != pd)
-		fclose(file);
-	if (!program)
-		return pickle_set_result_error(i, "Out Of Memory");
-
-	const int r = pickle_eval(i, program);
-	if (pickle_free(i, (void**)&program) != PICKLE_OK)
-		return PICKLE_ERROR;
-	return r;
-}
 
 static int convert(pickle_t *i, const char *s, int *d) {
 	assert(i);
 	assert(d);
 	if (sscanf(s, "%d", d) != 1)
-		return pickle_set_result_error(i, "Invalid number %s", d);
+		return error(i, "Invalid number %s", d);
 	return PICKLE_OK;
 }
 
@@ -249,7 +282,7 @@ static void wifi_initialize(void) {
 
 static int commandWiFiScan(pickle_t *i, int argc, char **argv, void *pd) {
 	if (argc != 1)
-		return pickle_set_result_error_arity(i, 1, argc, argv);
+		return error(i, "Invalid command %s: expected no args", argv[0]);
 #if 0
 	ESP_ERROR_CHECK(esp_netif_init());
 	ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -307,7 +340,7 @@ static int commandWiFiStatus(pickle_t *i, int argc, char **argv, void *pd) {
 
 static int commandWiFiDisconnect(pickle_t *i, int argc, char **argv, void *pd) {
 	if (argc != 1)
-		return pickle_set_result_error_arity(i, 1, argc, argv);
+		return error(i, "Invalid command %s: expected no args", argv[0]);
 	esp_wifi_disconnect();
 	return PICKLE_OK;
 }
@@ -332,7 +365,7 @@ static bool wifi_join(const char *ssid, const char *pass, int timeout_ms) {
 
 static int commandWiFiJoin(pickle_t *i, int argc, char **argv, void *pd) {
 	if (argc != 2 && argc != 3 && argc != 4)
-		return pickle_set_result_error_arity(i, 3, argc, argv);
+		return error(i, "Invalid command %s", argv[0]);
 
 	int timeout_ms = 10000;
 	if (argc == 4) {
@@ -346,13 +379,13 @@ static int commandWiFiJoin(pickle_t *i, int argc, char **argv, void *pd) {
 	printf("ssid(%s), password(%s), timeout(%d)" EOL, ssid, password, timeout_ms);
 	const int connected = wifi_join(ssid, password, timeout_ms);
 	if (!connected)
-		return pickle_set_result_error(i, "WiFi timeout");
-	return pickle_set_result(i, "Connected");
+		return error(i, "WiFi timeout");
+	return ok(i, "Connected");
 }
 
 static int commandWiFi(pickle_t *i, int argc, char **argv, void *pd) {
 	if (argc < 2)
-		return pickle_set_result_error_arity(i, 3, argc, argv);
+		return error(i, "Invalid command %s: expect status|join|disconnect|scan", argv[0]);
 	if (!strcmp(argv[1], "status"))
 		return commandWiFiStatus(i, argc - 1, argv + 1, pd);
 	if (!strcmp(argv[1], "join") || !strcmp(argv[1], "connect"))
@@ -363,7 +396,7 @@ static int commandWiFi(pickle_t *i, int argc, char **argv, void *pd) {
 	//	return commandWiFiWPS(i, argc - 1, argv + 1, pd);
 	if (!strcmp(argv[1], "scan"))
 		return commandWiFiScan(i, argc - 1, argv + 1, pd);
-	return pickle_set_result_error(i, "Invalid subcommand %s", argv[1]);
+	return error(i, "Invalid subcommand %s", argv[1]);
 }
 
 /* ======================= WiFi ======================= */
@@ -397,10 +430,10 @@ static int logging_level(const char *l, esp_log_level_t *e) {
 
 static int commandLogging(pickle_t *i, int argc, char **argv, void *pd) {
 	if (argc != 3)
-		return pickle_set_result_error_arity(i, 3, argc, argv);
+		return error(i, "Invalid command %s: expected logging level", argv[0]);
 	esp_log_level_t level = ESP_LOG_NONE;
 	if (logging_level(argv[2], &level) < 0)
-		return pickle_set_result_error(i, "Invalid logging level %s", argv[1]);
+		return error(i, "Invalid logging level %s", argv[1]);
 	esp_log_level_set(argv[1], ESP_LOG_ERROR);
 	return PICKLE_OK;
 }
@@ -418,7 +451,7 @@ static int make_a_pickle(pickle_t **ret, FILE *in, FILE *out) {
 	//if (setArgv(i, argc, argv)  != PICKLE_OK) goto fail;
 
 	typedef struct {
-		const char *name; pickle_command_func_t func; void *data;
+		const char *name; pickle_func_t func; void *data;
 	} commands_t;
 
 	const commands_t cmds[] = {
@@ -429,11 +462,12 @@ static int make_a_pickle(pickle_t **ret, FILE *in, FILE *out) {
 		{ "source",  commandSource,    NULL   },
 		{ "wifi",    commandWiFi,      NULL   },
 		{ "logging", commandLogging,   NULL   },
+		{ "clock",   commandClock,     NULL   },
 		//{ "system", commandConsole, NULL   },
 	};
 
 	for (size_t j = 0; j < sizeof (cmds) / sizeof (cmds[0]); j++)
-		if (pickle_register_command(i, cmds[j].name, cmds[j].func, cmds[j].data) != PICKLE_OK)
+		if (pickle_command_register(i, cmds[j].name, cmds[j].func, cmds[j].data) != PICKLE_OK)
 			goto fail;
 
 	*ret = i;
@@ -529,7 +563,7 @@ static int pickle_shell(void) {
 			//linenoiseHistorySave(HISTORY_PATH);
 		}
 		const int r = pickle_eval(i, line);
-		if (pickle_get_result_string(i, &rstr) != PICKLE_OK)
+		if (pickle_result_get(i, &rstr) != PICKLE_OK)
 			goto fail;
 		linenoiseFree(line);
 		snprintf(prompt, sizeof prompt, "[%d] pickle> ", r);
