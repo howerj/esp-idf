@@ -52,7 +52,7 @@ static void *reallocator(pickle_t *i, void *ptr, size_t sz) {
 	allocator_fn fn = NULL;
 	if (pickle_allocator_get(i, &fn, &arena) != PICKLE_OK)
 		abort();
-	void *r = allocator(arena, ptr, 0, sz);
+	void *r = fn(arena, ptr, 0, sz);
 	if (!r) {
 		release(i, ptr);
 		return NULL;
@@ -62,7 +62,7 @@ static void *reallocator(pickle_t *i, void *ptr, size_t sz) {
 
 static char *slurp(pickle_t *i, FILE *input, size_t *length, char *class) {
 	char *m = NULL;
-	const size_t bsz = class ? 4096 : 80;
+	const size_t bsz = class ? 80 : 4096;
 	size_t sz = 0;
 	if (length)
 		*length = 0;
@@ -108,7 +108,7 @@ static int commandGets(pickle_t *i, int argc, char **argv, void *pd) {
 			return PICKLE_ERROR;
 		return PICKLE_BREAK;
 	}
-	const int r = ok(i, line);
+	const int r = ok(i, "%s", line);
 	release(i, line);
 	return r;
 }
