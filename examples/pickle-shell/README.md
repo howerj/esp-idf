@@ -8,4 +8,6 @@ See the README.md file in the upper level 'examples' directory for more informat
 ## To Do
 
 - Separate out functionality and registering callbacks into different modules.
+- HTTP (Client and server, SSL)/OTA/MQTT/File-System/JSON/CDB
+- Add CDB as a component
 

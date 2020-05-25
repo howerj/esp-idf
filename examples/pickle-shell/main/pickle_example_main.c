@@ -1,18 +1,13 @@
 /* Pickle Shell: A TCL like language */
-#include <stdio.h>
-#include <string.h>
-#include <stdint.h>
-#include <time.h>
-#include "assert.h"
 #include "driver/uart.h"
-#include "errno.h"
 #include "esp_console.h"
+#include "esp_event.h"
 #include "esp_log.h"
-#include "esp_wifi.h"
 #include "esp_spi_flash.h"
 #include "esp_system.h"
 #include "esp_vfs_dev.h"
 #include "esp_vfs_fat.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
@@ -21,20 +16,29 @@
 #include "nvs_flash.h"
 #include "pickle.h"
 #include "sdkconfig.h"
-#include "esp_event.h"
+#include <assert.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
 
 #define UNUSED(X) ((void)(X))
 #define EOL "\r\n"
 #define ok(i, ...)    pickle_result_set(i, PICKLE_OK,    __VA_ARGS__)
 #define error(i, ...) pickle_result_set(i, PICKLE_ERROR, __VA_ARGS__)
+#define DEFAULT_WIFI_TIME_OUT_MS (10 * 1000ul)
 
 static const char *TAG = "pickle";
 
-/* NB. This allocator can be use to get memory statistics (printed atexit) or test allocation failures */
+typedef struct { long allocs, frees, reallocs, total; } heap_t;
+
+/* TODO: Use limited memory pool (<64KiB) so we do not consume all system resources */
 static void *allocator(void *arena, void *ptr, const size_t oldsz, const size_t newsz) {
-	UNUSED(arena);
-	if (newsz == 0) { free(ptr); return NULL; }
-	if (newsz > oldsz) return realloc(ptr, newsz);
+	assert(arena);
+	heap_t *h = arena;
+	if (newsz == 0) { if (ptr) h->frees++; free(ptr); return NULL; }
+	if (newsz > oldsz) { h->reallocs += !!ptr; h->allocs++; h->total += newsz; return realloc(ptr, newsz); }
 	return ptr;
 }
 
@@ -178,35 +182,26 @@ static int commandSource(pickle_t *i, int argc, char **argv, void *pd) {
 	FILE *file = argc == 1 ? pd : fopen(argv[1], "rb");
 	if (!file)
 		return error(i, "Could not open file '%s' for reading: %s", argv[1], strerror(errno));
-
 	char *program = slurp(i, file, NULL, NULL);
 	if (file != pd)
 		fclose(file);
 	if (!program)
 		return error(i, "Out Of Memory");
-
 	const int r = pickle_eval(i, program);
 	release(i, program);
 	return r;
 }
 
-/*static int commandConsole(pickle_t *i, int argc, char **argv, void *pd) {
-	UNUSED(pd);
+static int commandHeap(pickle_t *i, int argc, char **argv, void *pd) {
+	heap_t *h = pd;
 	if (argc != 2)
-		return pickle_set_result_error_arity(i, 2, argc, argv);
-	int ret = 0;
-	esp_err_t err = esp_console_run(argv[1], &ret);
-	if (err == ESP_ERR_NOT_FOUND) {
-        	return ok(i, "Invalid command");
-        } else if (err == ESP_ERR_INVALID_ARG) {
-        	// command was empty
-        } else if (err == ESP_OK && ret != ESP_OK) {
-        	return ok(i, "Command returned non-zero error code: 0x%x (%s)\n", ret, esp_err_to_name(ret));
-        } else if (err != ESP_OK) {
-		return ok(i, "Invalid internal state: %s", esp_err_to_name(err));
-        }
-	return ok(i, "");
-}*/
+		return error(i, "Invalid command %s", argv[0]);
+	if (!strcmp(argv[1], "frees"))         return ok(i, "%ld", h->frees);
+	if (!strcmp(argv[1], "allocations"))   return ok(i, "%ld", h->allocs);
+	if (!strcmp(argv[1], "total"))         return ok(i, "%ld", h->total);
+	if (!strcmp(argv[1], "reallocations")) return ok(i, "%ld", h->reallocs);
+	return error(i, "Invalid command %s", argv[0]);
+}
 
 static int convert(pickle_t *i, const char *s, int *d) {
 	assert(i);
@@ -217,8 +212,8 @@ static int convert(pickle_t *i, const char *s, int *d) {
 }
 
 /* ======================= WiFi ======================= */
-#define JOIN_TIMEOUT_MS (10000)
 
+/* TODO: Move to a structure */
 static EventGroupHandle_t wifi_event_group;
 const int CONNECTED_BIT = BIT0;
 
@@ -239,16 +234,17 @@ static const char *auth(const int mode) {
 
 static const char *cipher(const int type) {
 	switch (type) {
-	case WIFI_CIPHER_TYPE_NONE: return "NONE";
-	case WIFI_CIPHER_TYPE_WEP40: return "WEP40";
-	case WIFI_CIPHER_TYPE_WEP104: return "WEP104";
-	case WIFI_CIPHER_TYPE_TKIP: return "TKIP";
-	case WIFI_CIPHER_TYPE_CCMP: return "CCMP";
+	case WIFI_CIPHER_TYPE_NONE:      return "NONE";
+	case WIFI_CIPHER_TYPE_WEP40:     return "WEP40";
+	case WIFI_CIPHER_TYPE_WEP104:    return "WEP104";
+	case WIFI_CIPHER_TYPE_TKIP:      return "TKIP";
+	case WIFI_CIPHER_TYPE_CCMP:      return "CCMP";
 	case WIFI_CIPHER_TYPE_TKIP_CCMP: return "TKIP_CCMP";
 	}
 	return "UNKNOWN";
 }
 
+/* TODO: Handle more events */
 static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
 	if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
 		esp_wifi_connect();
@@ -283,26 +279,14 @@ static void wifi_initialize(void) {
 static int commandWiFiScan(pickle_t *i, int argc, char **argv, void *pd) {
 	if (argc != 1)
 		return error(i, "Invalid command %s: expected no args", argv[0]);
-#if 0
-	ESP_ERROR_CHECK(esp_netif_init());
-	ESP_ERROR_CHECK(esp_event_loop_create_default());
-	esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
-	assert(sta_netif);
-
-	wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-	ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-	ESP_ERROR_CHECK(esp_wifi_start());
-#else
 	wifi_initialize();
 	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-#endif
 	uint16_t number = DEFAULT_SCAN_LIST_SIZE;
 	wifi_ap_record_t ap_info[DEFAULT_SCAN_LIST_SIZE];
 	uint16_t ap_count = 0;
 	memset(ap_info, 0, sizeof(ap_info));
 
+	/* TODO: allow scan configuration to be set */
 #if 0
 	wifi_scan_config_t scan_config = {
 		.show_hidden = false,
@@ -319,6 +303,7 @@ static int commandWiFiScan(pickle_t *i, int argc, char **argv, void *pd) {
 	ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&number, ap_info));
 	ESP_ERROR_CHECK(esp_wifi_scan_get_ap_num(&ap_count));
 	ESP_LOGI(TAG, "Total APs scanned = %u", ap_count);
+	/* TODO: Return scan results */
 	for (int i = 0; (i < DEFAULT_SCAN_LIST_SIZE) && (i < ap_count); i++) {
 		wifi_ap_record_t *rec = &ap_info[i];
 		ESP_LOGI(TAG, "SSID \t\t%s", rec->ssid);
@@ -345,39 +330,33 @@ static int commandWiFiDisconnect(pickle_t *i, int argc, char **argv, void *pd) {
 	return PICKLE_OK;
 }
 
-static bool wifi_join(const char *ssid, const char *pass, int timeout_ms) {
+static bool wifi_join(const char *ssid, const char *pass, int timeout_ms, int bssid_known, uint8_t bssid[6]) {
 	wifi_initialize();
 	wifi_config_t wifi_config = { 0 };
-	/* Note: we can also set the BSSID and Channel (if known) as part of
-	 * the 'sta' structure. */
-	strlcpy((char *) wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
-	if (pass) {
-		strlcpy((char *) wifi_config.sta.password, pass, sizeof(wifi_config.sta.password));
-	}
+	strlcpy((char *) wifi_config.sta.ssid,     ssid, sizeof(wifi_config.sta.ssid));
+	strlcpy((char *) wifi_config.sta.password, pass, sizeof(wifi_config.sta.password));
+	wifi_config.sta.bssid_set = !!bssid_known;
+	memcpy(wifi_config.sta.bssid, bssid, 6);
 
-	ESP_ERROR_CHECK( esp_wifi_set_mode(WIFI_MODE_STA) );
-	ESP_ERROR_CHECK( esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config) );
-	ESP_ERROR_CHECK( esp_wifi_connect() );
+	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+	ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
+	ESP_ERROR_CHECK(esp_wifi_connect());
 
 	const int bits = xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT, pdFALSE, pdTRUE, timeout_ms / portTICK_PERIOD_MS);
 	return (bits & CONNECTED_BIT) != 0;
 }
 
 static int commandWiFiJoin(pickle_t *i, int argc, char **argv, void *pd) {
-	if (argc != 2 && argc != 3 && argc != 4)
-		return error(i, "Invalid command %s", argv[0]);
-
-	int timeout_ms = 10000;
-	if (argc == 4) {
-		sscanf(argv[3], "%d", &timeout_ms);
+	if (argc != 2 && argc != 3 && argc != 4 && argc != 5)
+		return error(i, "Invalid command %s: expected ssid password? timeout? bssid?", argv[0]);
+	int timeout_ms = DEFAULT_WIFI_TIME_OUT_MS;
+	if (argc == 4)
 		if (convert(i, argv[3], &timeout_ms) != PICKLE_OK)
 			return PICKLE_ERROR;
-	}
-
 	char *ssid = argv[1];
 	char *password = argc >= 3 ? argv[2] : "";
-	printf("ssid(%s), password(%s), timeout(%d)" EOL, ssid, password, timeout_ms);
-	const int connected = wifi_join(ssid, password, timeout_ms);
+	uint8_t bssid[6] = { 0 };
+	const int connected = wifi_join(ssid, password, timeout_ms, 0, bssid);
 	if (!connected)
 		return error(i, "WiFi timeout");
 	return ok(i, "Connected");
@@ -434,42 +413,131 @@ static int commandLogging(pickle_t *i, int argc, char **argv, void *pd) {
 	esp_log_level_t level = ESP_LOG_NONE;
 	if (logging_level(argv[2], &level) < 0)
 		return error(i, "Invalid logging level %s", argv[1]);
-	esp_log_level_set(argv[1], ESP_LOG_ERROR);
+	esp_log_level_set(argv[1], level);
 	return PICKLE_OK;
+}
+
+static int commandSystemInfo(pickle_t *i, int argc, char **argv, void *pd) {
+	UNUSED(pd);
+	if (argc < 2)
+		return error(i, "Invalid command %s", argv[0]);
+	if (!strcmp("reset", argv[1]))
+		return ok(i, "%d", (int) esp_reset_reason());
+	esp_chip_info_t chip_info;
+	esp_chip_info(&chip_info);
+	if (!strcmp("flash", argv[1]))
+		return ok(i, "%lu", (unsigned long)(spi_flash_get_chip_size()));
+	if (!strcmp("flash-internal", argv[1]))
+		return ok(i, "%c", chip_info.features & CHIP_FEATURE_EMB_FLASH ? '1' : '0');
+	if (!strcmp("target", argv[1]))
+		return ok(i, "%s", CONFIG_IDF_TARGET);
+	if (!strcmp("cores", argv[1]))
+		return ok(i, "%d", chip_info.cores);
+	if (!strcmp("bt", argv[1]))
+		return ok(i, "%c", chip_info.features & CHIP_FEATURE_BT ? '1' : '0');
+	if (!strcmp("ble", argv[1]))
+		return ok(i, "%c", chip_info.features & CHIP_FEATURE_BLE ? '1' : '0');
+	if (!strcmp("silicon", argv[1]))
+		return ok(i, "%d", chip_info.revision);
+	return error(i, "Invalid subcommand %s", argv[1]);
+}
+
+static int commandLinenoise(pickle_t *i, int argc, char **argv, void *pd) {
+	UNUSED(pd);
+	if (argc < 2)
+		return error(i, "Invalid command %s", argv[0]);
+	if (!strcmp("clear", argv[1])) {
+		linenoiseClearScreen();
+		return PICKLE_OK;
+	}
+	if (argc < 3)
+		return error(i, "Invalid command %s", argv[0]);
+	if (!strcmp("multiline", argv[1])) {
+		int on = 0;	
+		if (convert(i, argv[2], &on) < 0)
+			return PICKLE_ERROR;
+		linenoiseSetMultiLine(!!on);
+		return PICKLE_OK;
+	}
+	if (!strcmp("history-length", argv[1])) {
+		int len = 0;	
+		if (convert(i, argv[2], &len) < 0)
+			return PICKLE_ERROR;
+		if (len > 256 || len < 0)
+			error(i, "History length too large %d", len);
+		linenoiseHistorySetMaxLen(len);
+		return PICKLE_OK;
+	}
+	if (!strcmp("empty", argv[1])) {
+		int on = 0;	
+		if (convert(i, argv[2], &on) < 0)
+			return PICKLE_ERROR;
+		linenoiseAllowEmpty(!!on);
+		return PICKLE_OK;
+	}
+	if (!strcmp("dumb", argv[1])) {
+		int on = 0;	
+		if (convert(i, argv[2], &on) < 0)
+			return PICKLE_ERROR;
+		linenoiseSetDumbMode(!!on);
+		return PICKLE_OK;
+	}
+	/*if (!strcmp("mask", argv[1])) { // Not implemented in this version of linenoise
+		int on = 0;	
+		if (convert(i, argv[2], &on) < 0)
+			return PICKLE_ERROR;
+		on ? linenoiseMaskModeEnable() : linenoiseMaskModeDisable();
+		return PICKLE_OK;
+	}*/
+	if (!strcmp("history-save", argv[1])) {
+		if (linenoiseHistorySave(argv[2]) < 0)
+			return error(i, "failed to save history to file %s", argv[2]);
+		return PICKLE_OK;
+	}
+	if (!strcmp("history-load", argv[1])) {
+		if (linenoiseHistoryLoad(argv[2]) < 0)
+			return error(i, "failed to load history to file %s", argv[2]);
+		return PICKLE_OK;
+	}
+	return error(i, "Invalid subcommand %s", argv[1]);
 }
 
 /* ======================= Logging ==================== */
 
-static int make_a_pickle(pickle_t **ret, FILE *in, FILE *out) {
+static int make_a_pickle(pickle_t **ret, heap_t *h, FILE *in, FILE *out) {
 	assert(ret);
+	assert(h);
 	assert(in);
 	assert(out);
 	*ret = NULL;
 	pickle_t *i = NULL;
-	if (pickle_tests(allocator, NULL)   != PICKLE_OK) goto fail;
-	if (pickle_new(&i, allocator, NULL) != PICKLE_OK) goto fail;
-	//if (setArgv(i, argc, argv)  != PICKLE_OK) goto fail;
+	if (pickle_tests(allocator, h)   != PICKLE_OK) goto fail;
+	if (pickle_new(&i, allocator, h) != PICKLE_OK) goto fail;
+	//if (pickle_set_var_args(i, "argv", argc, argv)  != PICKLE_OK) goto fail;
 
 	typedef struct {
 		const char *name; pickle_func_t func; void *data;
 	} commands_t;
 
 	const commands_t cmds[] = {
-		{ "gets",    commandGets,      in     },
-		{ "puts",    commandPuts,      out    },
-		{ "getenv",  commandGetEnv,    NULL   },
-		{ "exit",    commandExit,      NULL   },
-		{ "source",  commandSource,    NULL   },
-		{ "wifi",    commandWiFi,      NULL   },
-		{ "logging", commandLogging,   NULL   },
-		{ "clock",   commandClock,     NULL   },
-		//{ "system", commandConsole, NULL   },
+		/* generic components                   */
+		{ "gets",      commandGets,       in     },
+		{ "puts",      commandPuts,       out    },
+		{ "getenv",    commandGetEnv,     NULL   },
+		{ "exit",      commandExit,       NULL   },
+		{ "source",    commandSource,     NULL   },
+		{ "clock",     commandClock,      NULL   },
+		{ "heap",      commandHeap,       h      },
+		/* esp32s2 specific components           */
+		{ "wifi",      commandWiFi,       NULL   },
+		{ "logging",   commandLogging,    NULL   },
+		{ "sysinf",    commandSystemInfo, NULL   },
+		{ "linenoise", commandLinenoise,  NULL   },
 	};
 
 	for (size_t j = 0; j < sizeof (cmds) / sizeof (cmds[0]); j++)
 		if (pickle_command_register(i, cmds[j].name, cmds[j].func, cmds[j].data) != PICKLE_OK)
 			goto fail;
-
 	*ret = i;
 	return 0;
 fail:
@@ -478,81 +546,57 @@ fail:
 	return -1;
 }
 
-/* TODO: Handle dumb terminal like original console program */
 static void initialize_console(void) {
-	/* Drain stdout before reconfiguring it */
 	fflush(stdout);
 	fsync(fileno(stdout));
-
-	/* Disable buffering on stdin */
 	setvbuf(stdin, NULL, _IONBF, 0);
-
-	/* Minicom, screen, idf_monitor send CR when ENTER key is pressed */
 	esp_vfs_dev_uart_set_rx_line_endings(ESP_LINE_ENDINGS_CR);
-	/* Move the caret to the beginning of the next line on '\n' */
 	esp_vfs_dev_uart_set_tx_line_endings(ESP_LINE_ENDINGS_CRLF);
 
 	/* Configure UART. Note that REF_TICK is used so that the baud rate remains
-	* correct while APB frequency is changing in light sleep mode.
-	*/
+	* correct while APB frequency is changing in light sleep mode. */
 	const uart_config_t uart_config = {
-		.baud_rate = CONFIG_ESP_CONSOLE_UART_BAUDRATE,
-		.data_bits = UART_DATA_8_BITS,
-		.parity = UART_PARITY_DISABLE,
-		.stop_bits = UART_STOP_BITS_1,
+		.baud_rate  = CONFIG_ESP_CONSOLE_UART_BAUDRATE,
+		.data_bits  = UART_DATA_8_BITS,
+		.parity     = UART_PARITY_DISABLE,
+		.stop_bits  = UART_STOP_BITS_1,
 		.source_clk = UART_SCLK_REF_TICK,
 	};
 	/* Install UART driver for interrupt-driven reads and writes */
-	ESP_ERROR_CHECK( uart_driver_install(CONFIG_ESP_CONSOLE_UART_NUM, 256, 0, 0, NULL, 0) );
-	ESP_ERROR_CHECK( uart_param_config(CONFIG_ESP_CONSOLE_UART_NUM, &uart_config) );
-
-	/* Tell VFS to use UART driver */
-	esp_vfs_dev_uart_use_driver(CONFIG_ESP_CONSOLE_UART_NUM);
-
-	/* Initialize the console */
-	esp_console_config_t console_config = {
-		.max_cmdline_args = 8,
-		.max_cmdline_length = 256,
-#if CONFIG_LOG_COLORS
-		.hint_color = atoi(LOG_COLOR_CYAN)
-#endif
-	};
-	ESP_ERROR_CHECK( esp_console_init(&console_config) );
+	ESP_ERROR_CHECK(uart_driver_install(CONFIG_ESP_CONSOLE_UART_NUM, 256, 0, 0, NULL, 0));
+	ESP_ERROR_CHECK(uart_param_config(CONFIG_ESP_CONSOLE_UART_NUM, &uart_config));
+	esp_vfs_dev_uart_use_driver(CONFIG_ESP_CONSOLE_UART_NUM); /* Tell VFS to use UART driver */
 
 	linenoiseSetMultiLine(1);
+	/* Could use 'info commands' for this */
 	//linenoiseSetCompletionCallback(&esp_console_get_completion);
-	//linenoiseSetHintsCallback((linenoiseHintsCallback*) &esp_console_get_hint);
 	linenoiseHistorySetMaxLen(100);
 	linenoiseAllowEmpty(true);
 
-#if CONFIG_STORE_HISTORY
-	/* Load command history from filesystem */
-	//linenoiseHistoryLoad(HISTORY_PATH);
-#endif
-
-   /* esp_console_register_help_command();
-    register_system();
-    register_wifi();
-    register_nvs();*/
+	/*if (linenoiseProbe()) { // zero indicates success
+		printf("\nDumb Terminal Mode!\n");
+		linenoiseSetDumbMode(1);
+	}*/
 }
 
+/* TODO: Store an equivalent file on flash and load it up using source */
 static int pickle_shell(void) {
 	initialize_console();
 	pickle_t *i = NULL;
+	heap_t h = { 0, };
 	char prompt[32] = "[S] pickle> ";
 	const char *rstr = ""; /* do not free */
-
 	FILE *in = stdin, *out = stdout;
-	if (make_a_pickle(&i, in, out) < 0)
+	if (make_a_pickle(&i, &h, in, out) < 0)
 		goto fail;
 
-	while (true) {
+	for (;;) {
 		if (rstr[0]) {
 			if (fputs(rstr, out) < 0) goto fail;
 			if (fputs(EOL, out) < 0) goto fail;
 			if (fflush(out) < 0) goto fail;
 		}
-		char *line = linenoise(prompt); /* linenoise should really accept either a FILE* or a filedes... */
+		char *line = linenoise(prompt);
 		if (line == NULL)
 			break;
 		if (fputs(EOL, out) < 0) goto fail;
@@ -568,58 +612,28 @@ static int pickle_shell(void) {
 		linenoiseFree(line);
 		snprintf(prompt, sizeof prompt, "[%d] pickle> ", r);
 	}
-	esp_console_deinit();
 	return pickle_delete(i) == PICKLE_OK ? 0 : -1;
 fail:
-	esp_console_deinit();
 	pickle_delete(i);
 	return -1;
 }
 
 static void initialize_nvs(void)
 {
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK( nvs_flash_erase() );
-        err = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(err);
+	esp_err_t err = nvs_flash_init();
+	if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+		ESP_ERROR_CHECK( nvs_flash_erase() );
+		err = nvs_flash_init();
+	}
+	ESP_ERROR_CHECK(err);
 }
 
 void app_main(void)
 {
-    initialize_nvs();
-    printf("Pickle Shell: How do you like those pickles?\n");
-
-    pickle_shell();
-
-    printf("Restarting now.\n");
-    fflush(stdout);
-    esp_restart();
-
-#if 0
-    /* Print chip information */
-    esp_chip_info_t chip_info;
-    esp_chip_info(&chip_info);
-    printf("This is %s chip with %d CPU cores, WiFi%s%s, ",
-            CONFIG_IDF_TARGET,
-            chip_info.cores,
-            (chip_info.features & CHIP_FEATURE_BT) ? "/BT" : "",
-            (chip_info.features & CHIP_FEATURE_BLE) ? "/BLE" : "");
-
-    printf("silicon revision %d, ", chip_info.revision);
-
-    printf("%dMB %s flash\n", spi_flash_get_chip_size() / (1024 * 1024),
-            (chip_info.features & CHIP_FEATURE_EMB_FLASH) ? "embedded" : "external");
-
-    printf("Free heap: %d\n", esp_get_free_heap_size());
-
-    for (int i = 10; i >= 0; i--) {
-        printf("Restarting in %d seconds...\n", i);
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-    }
-    printf("Restarting now.\n");
-    fflush(stdout);
-    esp_restart();
-#endif
+	initialize_nvs();
+	printf("Pickle Shell: How do you like these pickles?\n");
+	pickle_shell();
+	printf("Restarting now.\n");
+	fflush(stdout);
+	esp_restart();
 }
