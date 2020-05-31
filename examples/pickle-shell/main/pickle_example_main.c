@@ -8,6 +8,7 @@
 #include "esp_vfs_dev.h"
 #include "esp_vfs_fat.h"
 #include "esp_wifi.h"
+#include "esp_https_ota.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
@@ -24,7 +25,6 @@
 #include <time.h>
 
 #define UNUSED(X) ((void)(X))
-#define EOL "\r\n"
 #define ok(i, ...)    pickle_result_set(i, PICKLE_OK,    __VA_ARGS__)
 #define error(i, ...) pickle_result_set(i, PICKLE_ERROR, __VA_ARGS__)
 #define DEFAULT_WIFI_TIME_OUT_MS (10 * 1000ul)
@@ -33,12 +33,22 @@ static const char *TAG = "pickle";
 
 typedef struct { long allocs, frees, reallocs, total; } heap_t;
 
-/* TODO: Use limited memory pool (<64KiB) so we do not consume all system resources */
+/* TODO: (Optionally) Use limited memory pool (<64KiB) so we do not consume all system resources */
 static void *allocator(void *arena, void *ptr, const size_t oldsz, const size_t newsz) {
 	assert(arena);
 	heap_t *h = arena;
-	if (newsz == 0) { if (ptr) h->frees++; free(ptr); return NULL; }
-	if (newsz > oldsz) { h->reallocs += !!ptr; h->allocs++; h->total += newsz; return realloc(ptr, newsz); }
+	if (newsz == 0) { 
+		if (ptr) 
+			h->frees++; 
+		free(ptr); 
+		return NULL; 
+	}
+	if (newsz > oldsz) { 
+		h->reallocs += !!ptr; 
+		h->allocs++; 
+		h->total += newsz; 
+		return realloc(ptr, newsz); 
+	}
 	return ptr;
 }
 
@@ -211,14 +221,22 @@ static int convert(pickle_t *i, const char *s, int *d) {
 	return PICKLE_OK;
 }
 
-/* ======================= WiFi ======================= */
-
-/* TODO: Move to a structure */
-static EventGroupHandle_t wifi_event_group;
-const int CONNECTED_BIT = BIT0;
+/* ======================= ESP32 Specific Functions ======================= */
 
 //#define DEFAULT_SCAN_LIST_SIZE CONFIG_EXAMPLE_SCAN_LIST_SIZE
 #define DEFAULT_SCAN_LIST_SIZE (8u)
+#define CONNECTED_BIT (BIT0)
+
+typedef struct {
+	wifi_ap_record_t ap_info[DEFAULT_SCAN_LIST_SIZE];
+	uint16_t ap_count;
+	EventGroupHandle_t event;
+	bool initialized;
+} wifi_t;
+
+static wifi_t wifi = {
+	.initialized = false,
+};
 
 static const char *auth(const int mode) {
 	switch (mode) {
@@ -244,83 +262,206 @@ static const char *cipher(const int type) {
 	return "UNKNOWN";
 }
 
-/* TODO: Handle more events */
-static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
-	if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-		esp_wifi_connect();
-		xEventGroupClearBits(wifi_event_group, CONNECTED_BIT);
-	} else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-		xEventGroupSetBits(wifi_event_group, CONNECTED_BIT);
+static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+	wifi_t *w = arg;
+	assert(w);
+	if (event_base == WIFI_EVENT) {
+		switch (event_id) {
+		case WIFI_EVENT_STA_DISCONNECTED:
+			esp_wifi_connect();
+			xEventGroupClearBits(w->event, CONNECTED_BIT);
+			break;
+		case WIFI_EVENT_WIFI_READY: 
+		case WIFI_EVENT_SCAN_DONE:
+		case WIFI_EVENT_STA_START:
+		case WIFI_EVENT_STA_STOP: 
+		case WIFI_EVENT_STA_CONNECTED: 
+		case WIFI_EVENT_STA_AUTHMODE_CHANGE:  
+		default:
+			break;
+		}
+		return;
+	} 
+	if (event_base == IP_EVENT) {
+		switch (event_id) {
+		case IP_EVENT_STA_GOT_IP:
+			xEventGroupSetBits(w->event, CONNECTED_BIT);
+			break;
+		case IP_EVENT_STA_LOST_IP: /* handle? */
+		case IP_EVENT_AP_STAIPASSIGNED:
+		case IP_EVENT_GOT_IP6: /* handle? */
+		/* do not care */
+		case IP_EVENT_ETH_GOT_IP:
+		case IP_EVENT_PPP_GOT_IP:
+		case IP_EVENT_PPP_LOST_IP:
+		default:
+			break;
+		}
+		return;
 	}
 }
 
-static void wifi_initialize(void) {
-	esp_log_level_set("wifi", ESP_LOG_ERROR);
-	static bool initialized = false;
-	if (initialized)
+static void wifi_initialize(wifi_t *w) {
+	assert(w);
+	if (w->initialized)
 		return;
+	esp_log_level_set("wifi", ESP_LOG_ERROR);
 	ESP_ERROR_CHECK(esp_netif_init());
-	wifi_event_group = xEventGroupCreate();
+	w->event = xEventGroupCreate();
 	ESP_ERROR_CHECK(esp_event_loop_create_default());
 	esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();
 	assert(ap_netif);
 	esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
 	assert(sta_netif);
 	wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-	ESP_ERROR_CHECK( esp_wifi_init(&cfg) );
-	ESP_ERROR_CHECK( esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &event_handler, NULL) );
-	ESP_ERROR_CHECK( esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL) );
-	ESP_ERROR_CHECK( esp_wifi_set_storage(WIFI_STORAGE_RAM) );
-	ESP_ERROR_CHECK( esp_wifi_set_mode(WIFI_MODE_NULL) );
-	ESP_ERROR_CHECK( esp_wifi_start() );
-	initialized = true;
+	ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+	ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &event_handler, &wifi));
+	ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, &wifi));
+	ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_NULL));
+	ESP_ERROR_CHECK(esp_wifi_start());
+	w->initialized = true;
 }
 
-static int commandWiFiScan(pickle_t *i, int argc, char **argv, void *pd) {
-	if (argc != 1)
-		return error(i, "Invalid command %s: expected no args", argv[0]);
-	wifi_initialize();
-	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-	uint16_t number = DEFAULT_SCAN_LIST_SIZE;
-	wifi_ap_record_t ap_info[DEFAULT_SCAN_LIST_SIZE];
-	uint16_t ap_count = 0;
-	memset(ap_info, 0, sizeof(ap_info));
+static const char *yes(int d) {
+	return d ? "yes" : "no";
+}
 
-	/* TODO: allow scan configuration to be set */
-#if 0
-	wifi_scan_config_t scan_config = {
-		.show_hidden = false,
-		.scan_type = WIFI_SCAN_TYPE_PASSIVE,
-		.scan_time = {
-			.active = 200,
-			.passive = 500,
-		},
-	};
-	ESP_ERROR_CHECK(esp_wifi_scan_start(&scan_config, true));
-#else
-	ESP_ERROR_CHECK(esp_wifi_scan_start(NULL, true));
-#endif
-	ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&number, ap_info));
-	ESP_ERROR_CHECK(esp_wifi_scan_get_ap_num(&ap_count));
-	ESP_LOGI(TAG, "Total APs scanned = %u", ap_count);
-	/* TODO: Return scan results */
-	for (int i = 0; (i < DEFAULT_SCAN_LIST_SIZE) && (i < ap_count); i++) {
-		wifi_ap_record_t *rec = &ap_info[i];
-		ESP_LOGI(TAG, "SSID \t\t%s", rec->ssid);
-		ESP_LOGI(TAG, "RSSI \t\t%d", rec->rssi);
-		ESP_LOGI(TAG, "AUTH \t\t%s", auth(rec->authmode));
-		if (rec->authmode != WIFI_AUTH_WEP) {
-			ESP_LOGI(TAG, "Cipher(pairwise) \t\t%s", cipher(rec->pairwise_cipher));
-			ESP_LOGI(TAG, "Cipher(group)    \t\t%s", cipher(rec->group_cipher));
+static int WiFiScanPrint(pickle_t *i, wifi_t *w) {
+	assert(i);
+	assert(w);
+	w->ap_count = 0;
+	ESP_ERROR_CHECK(esp_wifi_scan_get_ap_num(&w->ap_count));
+	printf("Max AP records %u\n", DEFAULT_SCAN_LIST_SIZE);
+	printf("APs scanned    %u\n", w->ap_count);
+	for (int i = 0; (i < DEFAULT_SCAN_LIST_SIZE) && (i < w->ap_count); i++) {
+		wifi_ap_record_t *r = &w->ap_info[i];
+		uint8_t *b = r->bssid;
+		printf("SSID              %s\n", r->ssid);
+		printf("BSSID             %02x:%02x:%02x:%02x:%02x:%02x\n", b[0], b[1], b[2], b[3], b[4], b[5]);
+		printf("RSSI              %d\n", r->rssi);
+		printf("AUTH              %s\n", auth(r->authmode));
+		if (r->authmode != WIFI_AUTH_WEP) {
+			printf("Cipher(pairwise)  %s\n", cipher(r->pairwise_cipher));
+			printf("Cipher(group)     %s\n", cipher(r->group_cipher));
 		}
-		ESP_LOGI(TAG, "Channel \t\t%d\n", rec->primary);
+		printf("Channel primary   %d\n", r->primary);
+		printf("Channel secondary %d\n", (int)r->second);
+		printf("Supported 11b     %s\n", yes(r->phy_11b));
+		printf("Supported 11g     %s\n", yes(r->phy_11g));
+		printf("Supported 11n     %s\n", yes(r->phy_11n));
+		printf("Enabled low rate  %s\n", yes(r->phy_lr));
+		printf("Supported WPS     %s\n", yes(r->wps));
+		printf("\n");
 	}
 	return PICKLE_OK;
 }
 
+enum { ALL, SSID, RSSI, AUTH, BSSID, P11B, P11G, P11N, PLR, PWPS, ATERROR };
+
+static int WiFiLookupAttr(const char *name) {
+	assert(name);
+	static const char *attrs[] = {
+		[ALL]  = "all",  [SSID]  = "ssid",  [RSSI] = "rssi",
+		[AUTH] = "auth", [BSSID] = "bssid", [P11B] = "11b",
+		[P11G] = "11g",  [P11N]  = "11n",   [PLR]  = "lr",
+		[PWPS] = "wps",
+	};
+	int i = ATERROR;
+	for (int j = 0; (size_t)j < sizeof(attrs) / sizeof(attrs[0]); j++)
+		if (!strcmp(name, attrs[j])) {
+			i = j;
+			break;
+		}
+	return i;
+}
+
+static int WiFiScanGet(pickle_t *i, wifi_t *w, int op, unsigned recno) {
+	assert(i);
+	assert(w);
+	w->ap_count = 0;
+	ESP_ERROR_CHECK(esp_wifi_scan_get_ap_num(&w->ap_count));
+	if (w->ap_count == 0 || recno >= w->ap_count || recno >= DEFAULT_SCAN_LIST_SIZE)
+		return error(i, "recno > %u", MIN(w->ap_count, DEFAULT_SCAN_LIST_SIZE));
+	wifi_ap_record_t *r = &w->ap_info[recno];
+	uint8_t *b = r->bssid;
+	/* TODO: Lock access to this record and prevent further scans until
+	 * lock released */
+	switch (op) {
+	case ALL:
+		return ok(i, "{ssid {%s}} {rssi %d} {auth %s} {bssid %02x:%02x:%02x:%02x:%02x:%02x} {11b %s} {11g %s} {11n %s} {lr %s} {wps %s}", 
+				r->ssid, r->rssi, auth(r->authmode),
+				b[0], b[1], b[2], b[3], b[4], b[5],
+				yes(r->phy_11b), yes(r->phy_11g), yes(r->phy_11n), yes(r->phy_lr), yes(r->wps));
+	case SSID:  return ok(i, "%s", r->ssid);
+	case RSSI:  return ok(i, "%d", r->rssi);
+	case AUTH:  return ok(i, "%s", auth(r->authmode));
+	case BSSID: return ok(i, "%02x:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4], b[5]);
+	case P11B:  return ok(i, "%s", yes(r->phy_11b));
+	case P11G:  return ok(i, "%s", yes(r->phy_11g));
+	case P11N:  return ok(i, "%s", yes(r->phy_11n));
+	case PLR:   return ok(i, "%s", yes(r->phy_lr));
+	case PWPS:  return ok(i, "%s", yes(r->wps));
+	case ATERROR:
+	default:
+		return error(i, "Invalid attribute %d", op);
+	}
+	return error(i, "unreachable");
+}
+
+static int WiFiScan(pickle_t *i, wifi_t *w, wifi_scan_config_t *cfg) {
+	assert(i);
+	assert(w);
+	assert(cfg);
+	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+	uint16_t number = DEFAULT_SCAN_LIST_SIZE;
+	memset(w->ap_info, 0, sizeof(w->ap_info));
+	w->ap_count = 0;
+	/* TODO: Make a non blocking version */
+	ESP_ERROR_CHECK(esp_wifi_scan_start(cfg, true));
+	ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&number, w->ap_info));
+	return ok(i, "%d", (int)number);
+}
+
+static int commandWiFiScan(pickle_t *i, int argc, char **argv, void *pd) {
+	assert(pd);
+	wifi_t *w = pd;
+	wifi_initialize(w);
+	wifi_scan_config_t cfg = {
+		.show_hidden = false,
+		.scan_type = WIFI_SCAN_TYPE_PASSIVE,
+		//.scan_time = { .active = 200, .passive = 500, },
+	};
+
+	if (argc == 1 || !strcmp("initiate", argv[1]))
+		return WiFiScan(i, w, &cfg);
+
+	if (!strcmp("print", argv[1]))
+		return WiFiScanPrint(i, w);
+
+	if (!strcmp("get", argv[1])) {
+		if (argc != 3 && argc != 4)
+			return error(i, "Invalid subcommand %s: expected {recno|attr recno}", argv[1]);
+		int recno = 0;
+		if (convert(i, argc == 3 ? argv[2] : argv[3], &recno) != PICKLE_OK)
+			return PICKLE_ERROR;
+		return WiFiScanGet(i, w, WiFiLookupAttr(argc == 3 ? "all" : argv[2]), recno);
+	}
+
+	return error(i, "Invalid subcommand %s -- expected {|initiate|print|get #}", argv[0]);
+}
+
+/* TODO: If we have non-blocking version of scan/join, then we need a way
+ * to get the status of those operations */
 static int commandWiFiStatus(pickle_t *i, int argc, char **argv, void *pd) {
-	/* TODO: Read connect/scanning/station/AP/disconnect, and other WiFi information */
-	return PICKLE_OK;
+	assert(pd);
+	wifi_t *w = pd;
+	if (argc != 1)
+		return error(i, "Invalid command %s: expected no args", argv[0]);
+	if (w->event == NULL)
+		return ok(i, "-1");
+	const EventBits_t b = xEventGroupGetBits(w->event);
+	return ok(i, "%d", (int)!!(b & CONNECTED_BIT));
 }
 
 static int commandWiFiDisconnect(pickle_t *i, int argc, char **argv, void *pd) {
@@ -330,8 +471,9 @@ static int commandWiFiDisconnect(pickle_t *i, int argc, char **argv, void *pd) {
 	return PICKLE_OK;
 }
 
-static bool wifi_join(const char *ssid, const char *pass, int timeout_ms, int bssid_known, uint8_t bssid[6]) {
-	wifi_initialize();
+static bool WiFiJoin(wifi_t *w, const char *ssid, const char *pass, int timeout_ms, int bssid_known, uint8_t bssid[6]) {
+	assert(w);
+	wifi_initialize(w);
 	wifi_config_t wifi_config = { 0 };
 	strlcpy((char *) wifi_config.sta.ssid,     ssid, sizeof(wifi_config.sta.ssid));
 	strlcpy((char *) wifi_config.sta.password, pass, sizeof(wifi_config.sta.password));
@@ -342,7 +484,11 @@ static bool wifi_join(const char *ssid, const char *pass, int timeout_ms, int bs
 	ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
 	ESP_ERROR_CHECK(esp_wifi_connect());
 
-	const int bits = xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT, pdFALSE, pdTRUE, timeout_ms / portTICK_PERIOD_MS);
+	/* TODO: No timeout here, we can query/wait elsewhere, perhaps using vwait? Note that
+	 * if a scan is ongoing or another join is happening we should return
+	 * an error or wait, depending on mode. We could also have a 'wait
+	 * forever' option. */
+	const int bits = xEventGroupWaitBits(w->event, CONNECTED_BIT, pdFALSE, pdTRUE, timeout_ms / portTICK_PERIOD_MS);
 	return (bits & CONNECTED_BIT) != 0;
 }
 
@@ -356,31 +502,29 @@ static int commandWiFiJoin(pickle_t *i, int argc, char **argv, void *pd) {
 	char *ssid = argv[1];
 	char *password = argc >= 3 ? argv[2] : "";
 	uint8_t bssid[6] = { 0 };
-	const int connected = wifi_join(ssid, password, timeout_ms, 0, bssid);
+	const int connected = WiFiJoin(pd, ssid, password, timeout_ms, 0, bssid);
 	if (!connected)
 		return error(i, "WiFi timeout");
 	return ok(i, "Connected");
 }
 
 static int commandWiFi(pickle_t *i, int argc, char **argv, void *pd) {
+	assert(pd);
+	wifi_t *w = pd;
 	if (argc < 2)
 		return error(i, "Invalid command %s: expect status|join|disconnect|scan", argv[0]);
 	if (!strcmp(argv[1], "status"))
-		return commandWiFiStatus(i, argc - 1, argv + 1, pd);
+		return commandWiFiStatus(i, argc - 1, argv + 1, w);
 	if (!strcmp(argv[1], "join") || !strcmp(argv[1], "connect"))
-		return commandWiFiJoin(i, argc - 1, argv + 1, pd);
+		return commandWiFiJoin(i, argc - 1, argv + 1, w);
 	if (!strcmp(argv[1], "disconnect"))
 		return commandWiFiDisconnect(i, argc - 1, argv + 1, pd);
 	//if (!strcmp(argv[1], "wps"))
-	//	return commandWiFiWPS(i, argc - 1, argv + 1, pd);
+	//	return commandWiFiWPS(i, argc - 1, argv + 1, w);
 	if (!strcmp(argv[1], "scan"))
-		return commandWiFiScan(i, argc - 1, argv + 1, pd);
+		return commandWiFiScan(i, argc - 1, argv + 1, w);
 	return error(i, "Invalid subcommand %s", argv[1]);
 }
-
-/* ======================= WiFi ======================= */
-
-/* ======================= Logging ==================== */
 
 static int logging_level(const char *l, esp_log_level_t *e) {
 	assert(l);
@@ -450,6 +594,15 @@ static int commandLinenoise(pickle_t *i, int argc, char **argv, void *pd) {
 		linenoiseClearScreen();
 		return PICKLE_OK;
 	}
+	if (!strcmp("line", argv[1])) {
+		char *line = linenoise(argc < 3 ? "> " : argv[2]);
+		if (!line)
+			return pickle_result_set(i, PICKLE_BREAK, "EOF");
+		const int r = ok(i, "%s", line);
+		linenoiseFree(line);
+		return r;
+	}
+
 	if (argc < 3)
 		return error(i, "Invalid command %s", argv[0]);
 	if (!strcmp("multiline", argv[1])) {
@@ -502,7 +655,32 @@ static int commandLinenoise(pickle_t *i, int argc, char **argv, void *pd) {
 	return error(i, "Invalid subcommand %s", argv[1]);
 }
 
-/* ======================= Logging ==================== */
+static int commandRandom(pickle_t *i, int argc, char **argv, void *pd) {
+	UNUSED(pd);
+	if (argc != 1)
+		return error(i, "Invalid command %s", argv[0]);
+	/* NOTE: we could return an error if the WiFi module is not enabled, or
+	 * we could just enable it, the entropy source comes from the radio
+	 * (WiFI or Bluetooth) front ends */
+	return ok(i, "%ld", (long)esp_random());
+}
+
+static int commandOta(pickle_t *i, int argc, char **argv, void *pd) {
+	if (argc != 2 && argc != 4)
+		return error(i, "Invalid command %s -- expected {URL|URL username password}", argv[0]);
+	esp_http_client_config_t config = {
+		.url = argv[1],
+		.cert_pem = NULL, /*TODO: set this '(char *)server_cert_pem_start, */
+		.username = argc == 4 ? argv[2] : NULL,
+		.password = argc == 4 ? argv[3] : NULL,
+	};
+	esp_err_t ret = esp_https_ota(&config);
+	return ok(i, "%d", ret == ESP_OK ? 0 : -1);
+}
+
+/* ======================= ESP32 Specific Functions ======================= */
+
+/* ======================= Pickle Shell Setup       ======================= */
 
 static int make_a_pickle(pickle_t **ret, heap_t *h, FILE *in, FILE *out) {
 	assert(ret);
@@ -513,26 +691,30 @@ static int make_a_pickle(pickle_t **ret, heap_t *h, FILE *in, FILE *out) {
 	pickle_t *i = NULL;
 	if (pickle_tests(allocator, h)   != PICKLE_OK) goto fail;
 	if (pickle_new(&i, allocator, h) != PICKLE_OK) goto fail;
-	//if (pickle_set_var_args(i, "argv", argc, argv)  != PICKLE_OK) goto fail;
+	if (pickle_var_set_args(i, "argv", 1, (char*[]){"pickle"})  != PICKLE_OK) goto fail;
 
 	typedef struct {
-		const char *name; pickle_func_t func; void *data;
+		const char *name;
+		pickle_func_t func;
+		void *data;
 	} commands_t;
 
 	const commands_t cmds[] = {
 		/* generic components                   */
-		{ "gets",      commandGets,       in     },
-		{ "puts",      commandPuts,       out    },
-		{ "getenv",    commandGetEnv,     NULL   },
-		{ "exit",      commandExit,       NULL   },
-		{ "source",    commandSource,     NULL   },
-		{ "clock",     commandClock,      NULL   },
-		{ "heap",      commandHeap,       h      },
+		{ "gets",      commandGets,       in,    },
+		{ "puts",      commandPuts,       out,   },
+		{ "getenv",    commandGetEnv,     NULL,  },
+		{ "exit",      commandExit,       NULL,  },
+		{ "source",    commandSource,     NULL,  },
+		{ "clock",     commandClock,      NULL,  },
+		{ "heap",      commandHeap,       h,     },
 		/* esp32s2 specific components           */
-		{ "wifi",      commandWiFi,       NULL   },
-		{ "logging",   commandLogging,    NULL   },
-		{ "sysinf",    commandSystemInfo, NULL   },
-		{ "linenoise", commandLinenoise,  NULL   },
+		{ "wifi",      commandWiFi,       &wifi, },
+		{ "logging",   commandLogging,    NULL,  },
+		{ "sysinf",    commandSystemInfo, NULL,  },
+		{ "linenoise", commandLinenoise,  NULL,  },
+		{ "random",    commandRandom,     NULL,  },
+		{ "ota",       commandOta,        NULL,  },
 	};
 
 	for (size_t j = 0; j < sizeof (cmds) / sizeof (cmds[0]); j++)
@@ -541,7 +723,7 @@ static int make_a_pickle(pickle_t **ret, heap_t *h, FILE *in, FILE *out) {
 	*ret = i;
 	return 0;
 fail:
-	pickle_delete(i);
+	(void)pickle_delete(i);
 	*ret = NULL;
 	return -1;
 }
@@ -593,13 +775,13 @@ static int pickle_shell(void) {
 	for (;;) {
 		if (rstr[0]) {
 			if (fputs(rstr, out) < 0) goto fail;
-			if (fputs(EOL, out) < 0) goto fail;
+			if (fputs("\n", out) < 0) goto fail;
 			if (fflush(out) < 0) goto fail;
 		}
 		char *line = linenoise(prompt);
 		if (line == NULL)
 			break;
-		if (fputs(EOL, out) < 0) goto fail;
+		if (fputs("\n", out) < 0) goto fail;
 		if (fflush(out) < 0) goto fail;
 		if (line[0]) {
 			linenoiseHistoryAdd(line);
@@ -618,8 +800,7 @@ fail:
 	return -1;
 }
 
-static void initialize_nvs(void)
-{
+static void nvs_initialize(void) {
 	esp_err_t err = nvs_flash_init();
 	if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
 		ESP_ERROR_CHECK( nvs_flash_erase() );
@@ -628,12 +809,41 @@ static void initialize_nvs(void)
 	ESP_ERROR_CHECK(err);
 }
 
-void app_main(void)
-{
-	initialize_nvs();
-	printf("Pickle Shell: How do you like these pickles?\n");
+/* TODO: If we provide the right commands to the interpreter, we could remove this */
+static wl_handle_t fs_initialize(const char *base_path) {
+	assert(base_path);
+	ESP_LOGI(TAG, "FAT FS Mount");
+	wl_handle_t handle = WL_INVALID_HANDLE;
+	const esp_vfs_fat_mount_config_t mount_config = {
+		.max_files              = 8,
+		.format_if_mount_failed = true,
+		.allocation_unit_size   = CONFIG_WL_SECTOR_SIZE
+	};
+	esp_err_t err = esp_vfs_fat_spiflash_mount(base_path, "storage", &mount_config, &handle);
+	if (err != ESP_OK) {
+		ESP_LOGE(TAG, "Failed to mount FATFS (%s)", esp_err_to_name(err));
+		return WL_INVALID_HANDLE;
+	}
+	return handle;
+}
+
+static void fs_deinitialize(const char *base_path, wl_handle_t handle) {
+	ESP_LOGI(TAG, "FAT FS Unmount");
+	if (handle == WL_INVALID_HANDLE)
+		return;
+	ESP_ERROR_CHECK(esp_vfs_fat_spiflash_unmount(base_path, handle));
+}
+
+static const char *base_path = "/spiflash";
+
+void app_main(void) {
+	nvs_initialize();
+	wl_handle_t h = fs_initialize(base_path);
+	ESP_LOGI(TAG, "Pickle Shell: How do you like these pickles?");
 	pickle_shell();
-	printf("Restarting now.\n");
+	ESP_LOGI(TAG, "Restarting now.");
 	fflush(stdout);
+	fs_deinitialize(base_path, h);
 	esp_restart();
 }
+
