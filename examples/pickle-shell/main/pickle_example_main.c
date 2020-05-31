@@ -19,6 +19,7 @@
 #include "sdkconfig.h"
 #include <assert.h>
 #include <sys/types.h>
+#include <dirent.h>
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -110,6 +111,7 @@ static char *slurp(pickle_t *i, FILE *input, size_t *length, char *class) {
 	return m;
 }
 
+/* TODO: Support reading from a file descriptor as well */
 static int commandGets(pickle_t *i, int argc, char **argv, void *pd) {
 	if (argc != 1)
 		return error(i, "Invalid command %s", argv[0]);
@@ -128,6 +130,7 @@ static int commandGets(pickle_t *i, int argc, char **argv, void *pd) {
 	return r;
 }
 
+/* TODO: Support writing to a file descriptor as well */
 static int commandPuts(pickle_t *i, int argc, char **argv, void *pd) {
 	FILE *out = pd;
 	if (argc != 1 && argc != 2 && argc != 3)
@@ -697,6 +700,26 @@ static int commandErrno(pickle_t *i, int argc, char **argv, void *pd) {
 	return ok(i, "%s", strerror(e));
 }
 
+static int commandSetEnv(pickle_t *i, int argc, char **argv, void *pd) {
+	UNUSED(pd);
+	if (argc != 3)
+		return error(i, "Invalid command %s -- expected variable value", argv[0]);
+	errno = 0;
+	if (setenv(argv[1], argv[2], 1) < 0)
+		return error(i, "Cannot set '%s' to '%s': %s", argv[1], argv[2], strerror(errno));
+	return PICKLE_OK;
+}
+
+static int commandUnSetEnv(pickle_t *i, int argc, char **argv, void *pd) {
+	UNUSED(pd);
+	if (argc != 2)
+		return error(i, "Invalid command %s -- expected variable", argv[0]);
+	errno = 0;
+	if (unsetenv(argv[1]) < 0)
+		return error(i, "Cannot unset '%s': %s", strerror(errno));
+	return PICKLE_OK;
+}
+
 /* Half-inched from <https://git.musl-libc.org/cgit/musl/tree/src/stdio/__fmodeflags.c> */
 static int fmodeflags(const char *mode) {
 	assert(mode);
@@ -895,6 +918,7 @@ static int commandUnlink(pickle_t *i, int argc, char **argv, void *pd) {
 	return PICKLE_OK;
 }
 
+/* BUG: Linking directories causes panic */
 static int commandLink(pickle_t *i, int argc, char **argv, void *pd) {
 	UNUSED(pd);
 	if (argc != 3)
@@ -922,6 +946,37 @@ static inline int commandUtime(pickle_t *i, int argc, char **argv, void *pd) {
 	return PICKLE_OK;
 }
 
+static inline int commandChdir(pickle_t *i, int argc, char **argv, void *pd) {
+	UNUSED(pd);
+	if (argc != 2)
+		return error(i, "Invalid command %s -- expected path", argv[0]);
+	errno = 0;
+	if (chdir(argv[1]) < 0)
+		return error(i, "Unable to change directory to '%s': %s", argv[1], strerror(errno));
+	return PICKLE_OK;
+}
+
+static inline int commandGetcwd(pickle_t *i, int argc, char **argv, void *pd) {
+	if (argc != 1)
+		return error(i, "Invalid command %s -- expected no arguments", argv[0]);
+	errno = 0;
+	char buf[257] = { 0 };
+	if (getcwd(buf, sizeof (buf) - 1) == NULL)
+		return error(i, "Unable to get current working directory: %s", strerror(errno));
+	return ok(i, "%s", buf);
+}
+
+/* TODO: Support mode bits, at fmkdir as well */
+static inline int commandMkdir(pickle_t *i, int argc, char **argv, void *pd) {
+	UNUSED(pd);
+	if (argc != 2)
+		return error(i, "Invalid command %s -- expected path", argv[0]);
+	errno = 0;
+	if (mkdir(argv[1], 0777) < 0)
+		return error(i, "Unable to make directory '%s': %s", argv[1], strerror(errno));
+	return PICKLE_OK;
+}
+
 static int commandDf(pickle_t *i, int argc, char **argv, void *pd) {
 	if (argc != 1 && argc != 2)
 		return error(i, "Invalid command %s -- partition-number?", argv[0]);
@@ -941,10 +996,44 @@ static int commandDf(pickle_t *i, int argc, char **argv, void *pd) {
 	return argc == 1 ? ok(i, "%d", partitions) : r;
 }
 
+/* BUG: directory listing does not work correctly for the root file system */
+static void listdir(const char *name, int indent, int recursive) {
+	assert(name);
+	DIR *dir = opendir(name);
+	if (!dir)
+		return;
+	for (struct dirent *entry = NULL;(entry = readdir(dir)) != NULL;) {
+		if (entry->d_type == DT_DIR) {
+			char path[1024];
+			if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+				continue;
+			snprintf(path, sizeof(path), "%s/%s", name, entry->d_name);
+			printf("%*s[%s]\n", indent, "", entry->d_name);
+			if (recursive)
+				listdir(path, indent + 2, recursive);
+		} else {
+			printf("%*s- %s\n", indent, "", entry->d_name);
+		}
+	}
+	closedir(dir);
+}
+
+/* TODO: Return result, non-recursive */
+static int commandLs(pickle_t *i, int argc, char **argv, void *pd) {
+	UNUSED(pd);
+	if (argc <= 1) {
+		const char *cwd = getenv("PWD");
+		listdir(cwd ? cwd : ".", 0, 1);
+		return PICKLE_OK;
+	}
+	for (int j = 1; j < argc; j++)
+		listdir(argv[j], 0, 1);
+	return PICKLE_OK;
+}
+
 /* ======================= ESP32 Specific Functions ======================= */
 
 /* ======================= Pickle Shell Setup       ======================= */
-
 static int make_a_pickle(pickle_t **ret, heap_t *h, FILE *in, FILE *out) {
 	assert(ret);
 	assert(h);
@@ -980,6 +1069,8 @@ static int make_a_pickle(pickle_t **ret, heap_t *h, FILE *in, FILE *out) {
 		{ "ota",       commandOta,        NULL,  },
 		{ "errno",     commandErrno,      NULL,  },
 
+		{ "setenv",    commandSetEnv,     NULL,  },
+		{ "unsetenv",  commandUnSetEnv,   NULL,  },
 		{ "open",      commandOpen,       NULL,  },
 		{ "close",     commandClose,      NULL,  },
 		{ "read",      commandRead,       NULL,  },
@@ -990,9 +1081,13 @@ static int make_a_pickle(pickle_t **ret, heap_t *h, FILE *in, FILE *out) {
 		{ "frename",   commandRename,     NULL,  },
 		{ "unlink",    commandUnlink,     NULL,  },
 		{ "link",      commandLink,       NULL,  },
-		//{ "utime",     commandUtime,      NULL,  },
+		//{ "utime",     commandUtime,      NULL,  }, // crashes system
+		//{ "chdir",     commandChdir,      NULL,  }, // unsupported
+		//{ "getcwd",    commandGetcwd,     NULL,  }, // unsupported
+		{ "mkdir",     commandMkdir,      NULL,  },
 
 		{ "df",        commandDf,         NULL,  },
+		{ "ls",        commandLs,         NULL,  },
 	};
 
 	for (size_t j = 0; j < sizeof (cmds) / sizeof (cmds[0]); j++)
@@ -1039,6 +1134,8 @@ static void initialize_console(void) {
 	}*/
 }
 
+static const char *base_path = "/spiflash";
+
 /* TODO: Store an equivalent file on flash and load it up using source */
 static int pickle_shell(void) {
 	initialize_console();
@@ -1049,6 +1146,9 @@ static int pickle_shell(void) {
 	FILE *in = stdin, *out = stdout;
 	if (make_a_pickle(&i, &h, in, out) < 0)
 		goto fail;
+	if (setenv("PWD",  base_path, 1) < 0) goto fail;
+	if (setenv("HOME", base_path, 1) < 0) goto fail;
+	if (setenv("OS",   "esp32s2", 1) < 0) goto fail;
 
 	for (;;) {
 		if (rstr[0]) {
@@ -1074,7 +1174,8 @@ static int pickle_shell(void) {
 	}
 	return pickle_delete(i) == PICKLE_OK ? 0 : -1;
 fail:
-	pickle_delete(i);
+	if (i)
+		pickle_delete(i);
 	return -1;
 }
 
@@ -1113,40 +1214,9 @@ static void fs_deinitialize(const char *base_path, wl_handle_t handle) {
 	ESP_ERROR_CHECK(esp_vfs_fat_spiflash_unmount(base_path, handle));
 }
 
-static const char *base_path = "/spiflash";
-
-static void file_example(void) {
-	ESP_LOGI(TAG, "Opening file");
-	FILE *f = fopen("/spiflash/hello.txt", "wb");
-	if (f == NULL) {
-		ESP_LOGE(TAG, "Failed to open file for writing");
-		return;
-	}
-	fprintf(f, "written using ESP-IDF %s\n", esp_get_idf_version());
-	fclose(f);
-	ESP_LOGI(TAG, "File written");
-
-	ESP_LOGI(TAG, "Reading file");
-	f = fopen("/spiflash/hello.txt", "rb");
-	if (f == NULL) {
-		ESP_LOGE(TAG, "Failed to open file for reading");
-		return;
-	}
-	char line[128];
-	fgets(line, sizeof(line), f);
-	fclose(f);
-	char *pos = strchr(line, '\n');
-	if (pos) {
-		*pos = '\0';
-	}
-	ESP_LOGI(TAG, "Read from file: '%s'", line);
-}
-
 void app_main(void) {
 	nvs_initialize();
 	wl_handle_t h = fs_initialize(base_path);
-	if (0)
-		file_example();
 	ESP_LOGI(TAG, "Pickle Shell: How do you like these pickles?");
 	pickle_shell();
 	ESP_LOGI(TAG, "Restarting now.");
