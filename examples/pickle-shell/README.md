@@ -10,4 +10,7 @@ See the README.md file in the upper level 'examples' directory for more informat
 - Separate out functionality and registering callbacks into different modules.
 - HTTP (Client and server, SSL)/OTA/MQTT/File-System/JSON/CDB
 - Add CDB as a component
+- Add commands for peripheral manipulation:
+  - GPIO mainly, maybe UART and i2c.
+- Document all of the new commands
 

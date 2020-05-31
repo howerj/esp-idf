@@ -18,6 +18,7 @@
 #include "pickle.h"
 #include "sdkconfig.h"
 #include <assert.h>
+#include <sys/types.h>
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -385,8 +386,7 @@ static int WiFiScanGet(pickle_t *i, wifi_t *w, int op, unsigned recno) {
 		return error(i, "recno > %u", MIN(w->ap_count, DEFAULT_SCAN_LIST_SIZE));
 	wifi_ap_record_t *r = &w->ap_info[recno];
 	uint8_t *b = r->bssid;
-	/* TODO: Lock access to this record and prevent further scans until
-	 * lock released */
+	/* TODO: Lock access to this record and prevent further scans until lock released */
 	switch (op) {
 	case ALL:
 		return ok(i, "{ssid {%s}} {rssi %d} {auth %s} {bssid %02x:%02x:%02x:%02x:%02x:%02x} {11b %s} {11g %s} {11n %s} {lr %s} {wps %s}", 
@@ -567,6 +567,12 @@ static int commandSystemInfo(pickle_t *i, int argc, char **argv, void *pd) {
 		return error(i, "Invalid command %s", argv[0]);
 	if (!strcmp("reset", argv[1]))
 		return ok(i, "%d", (int) esp_reset_reason());
+	if (!strcmp("heap-current", argv[1]))
+		return ok(i, "%lu", (unsigned long)esp_get_free_heap_size());
+	if (!strcmp("heap-max", argv[1]))
+		return ok(i, "%lu", (unsigned long)esp_get_minimum_free_heap_size());
+	if (!strcmp("stack-high", argv[1]))
+		return ok(i, "%lu", (unsigned long)uxTaskGetStackHighWaterMark(NULL));
 	esp_chip_info_t chip_info;
 	esp_chip_info(&chip_info);
 	if (!strcmp("flash", argv[1]))
@@ -583,6 +589,7 @@ static int commandSystemInfo(pickle_t *i, int argc, char **argv, void *pd) {
 		return ok(i, "%c", chip_info.features & CHIP_FEATURE_BLE ? '1' : '0');
 	if (!strcmp("silicon", argv[1]))
 		return ok(i, "%d", chip_info.revision);
+
 	return error(i, "Invalid subcommand %s", argv[1]);
 }
 
@@ -678,6 +685,262 @@ static int commandOta(pickle_t *i, int argc, char **argv, void *pd) {
 	return ok(i, "%d", ret == ESP_OK ? 0 : -1);
 }
 
+static int commandErrno(pickle_t *i, int argc, char **argv, void *pd) {
+	UNUSED(pd);
+	if (argc != 1 && argc != 2)
+		return error(i, "Invalid command %s -- expected number?", argv[0]);
+	if (argc == 1)
+		return ok(i, "%d", errno);
+	int e = 0;
+	if (convert(i, argv[1], &e) != PICKLE_OK)
+		return PICKLE_ERROR;
+	return ok(i, "%s", strerror(e));
+}
+
+/* Half-inched from <https://git.musl-libc.org/cgit/musl/tree/src/stdio/__fmodeflags.c> */
+static int fmodeflags(const char *mode) {
+	assert(mode);
+	int flags = O_WRONLY;
+	if (strchr(mode, '+')) flags = O_RDWR;
+	else if (*mode == 'r') flags = O_RDONLY;
+	else flags = O_WRONLY;
+	if (strchr(mode, 'x')) flags |= O_EXCL;
+	/*if (strchr(mode, 'e')) flags |= O_CLOEXEC; // not implemented */
+	if (*mode != 'r') flags |= O_CREAT;
+	if (*mode == 'w') flags |= O_TRUNC;
+	if (*mode == 'a') flags |= O_APPEND;
+	return flags;
+}
+
+/* View: <https://sourceware.org/newlib/> for more information on these system calls */
+static int commandOpen(pickle_t *i, int argc, char **argv, void *pd) {
+	if (argc != 3 && argc != 4)
+		return error(i, "Invalid command %s -- expected path flags mode?", argv[0]);
+	int mode = S_IRWXU | S_IRWXG | S_IRWXO;
+	if (argc == 4) {
+		/* TODO: Handle user permissions */
+	}
+	if (!strchr("rwa", argv[2][0]))
+		return error(i, "Invalid flags %s", argv[2]);
+	const int flags = fmodeflags(argv[2]);
+
+	errno = 0;
+	int fd = open(argv[1], flags, mode);
+	if (fd < 0)
+		return error(i, "Could not open file '%s' in mode %s: %s", argv[1], argv[2], strerror(errno));
+	return ok(i, "%d", fd);
+}
+
+static int commandClose(pickle_t *i, int argc, char **argv, void *pd) {
+	UNUSED(pd);
+	if (argc != 2)
+		return error(i, "Invalid command %s -- expected fd", argv[0]);
+	int fd = -1;
+	if (convert(i, argv[1], &fd) != PICKLE_OK)
+		return PICKLE_ERROR;
+	errno = 0;
+	if (close(fd) < 0)
+		return error(i, "Close failed %d: %s", fd, strerror(errno));
+	return PICKLE_OK;
+}
+
+/* NOTE: We could deal with binary data by reading and writing base64 encoded
+ * data, or by reading and writing single bytes at a time and converting the
+ * result to and from an integer value, either way it will be inefficient */
+
+static int commandRead(pickle_t *i, int argc, char **argv, void *pd) {
+	UNUSED(pd);
+	if (argc != 3)
+		return error(i, "Invalid command %s -- expected fd bytes", argv[0]);
+	int fd = -1, bytes = 0;
+	if (convert(i, argv[1], &fd) != PICKLE_OK)
+		return PICKLE_ERROR;
+	if (convert(i, argv[2], &bytes) != PICKLE_OK)
+		return PICKLE_ERROR;
+	if (bytes < 0 || bytes > 256)
+		return error(i, "byte count invalid %d", bytes);
+	errno = 0;
+	char s[256+1] = { 0 };
+	const int rode = read(fd, s, bytes);
+	if (rode < 0)
+		return error(i, "read failed %d: %s got %s", fd, strerror(errno), s);
+	s[rode] = '\0';
+	if (memchr(s, 0, rode))
+		return error(i, "contains binary data");
+	return ok(i, "%d {%s}", rode, s);
+}
+
+static int commandWrite(pickle_t *i, int argc, char **argv, void *pd) {
+	UNUSED(pd);
+	if (argc != 3)
+		return error(i, "Invalid command %s -- expected fd string", argv[0]);
+	int fd = -1;
+	if (convert(i, argv[1], &fd) != PICKLE_OK)
+		return PICKLE_ERROR;
+	errno = 0;
+	const int slen = strlen(argv[2]);
+	const int wrote = write(fd, argv[2], slen);
+	if (wrote < 0 || wrote != slen)
+		return error(i, "only wrote %d bytes: %s", wrote, strerror(errno));
+	return ok(i, "%d", wrote);
+}
+
+static int commandSeek(pickle_t *i, int argc, char **argv, void *pd) {
+	UNUSED(pd);
+	if (argc != 4)
+		return error(i, "Invalid command %s -- expected fd position {set|current|end}", argv[0]);
+	int fd = -1, pos = 0;
+	if (convert(i, argv[1], &fd) != PICKLE_OK)
+		return PICKLE_ERROR;
+	if (convert(i, argv[2], &pos) != PICKLE_OK)
+		return PICKLE_ERROR;
+	if (pos < 0)
+		return error(i, "position invalid %d", pos);
+	int mode = 0;
+	if (!strcmp("set", argv[3]))
+		mode = SEEK_SET;
+	else if (!strcmp("current", argv[3]))
+		mode = SEEK_CUR;
+	else if (!strcmp("end", argv[3]))
+		mode = SEEK_END;
+	else
+		return error(i, "Invalid whence %s", argv[3]);
+	errno = 0;
+	const int r = lseek(fd, pos, mode);
+	if (r < 0)
+		return error(i, "lseek failed: %s", strerror(errno));
+	return ok(i, "%d", r);
+}
+
+static int statReturn(pickle_t *i, struct stat *st) {
+	assert(i);
+	assert(st);
+	const char *mode = "unknown";
+	switch (st->st_mode & S_IFMT) {
+	case S_IFBLK:  mode = "block-device";     break;
+	case S_IFCHR:  mode = "character-device"; break;
+	case S_IFDIR:  mode = "directory";        break;
+	case S_IFIFO:  mode = "FIFO/pipe";        break;
+	case S_IFLNK:  mode = "symlink";          break;
+	case S_IFREG:  mode = "regular-file";     break;
+	case S_IFSOCK: mode = "socket";           break;
+	}
+
+	return ok(i, "inode=%ld mode=%s omode=%lo nlink=%ld uid=%ld gid=%ld rdev=%ld size=%ld blksize=%ld blocks=%ld atime=%ld mtime=%ld ctime=%ld", 
+		(long)st->st_ino,
+		mode,
+		(long)st->st_mode,
+		(long)st->st_nlink,
+		(long)st->st_uid,
+		(long)st->st_gid,
+		(long)st->st_rdev,
+		(long)st->st_size,
+		(long)st->st_blksize,
+		(long)st->st_blocks,
+		(long)st->st_atime,
+		(long)st->st_mtime,
+		(long)st->st_ctime);
+}
+
+static int commandStat(pickle_t *i, int argc, char **argv, void *pd) {
+	UNUSED(pd);
+	if (argc != 2)
+		return error(i, "Invalid command %s -- expected file", argv[0]);
+	struct stat st;
+	memset(&st, 0, sizeof st);
+	errno = 0;
+	if (stat(argv[1], &st) < 0)
+		return error(i, "stat on file '%s' failed: %s", argv[1], strerror(errno));
+	return statReturn(i, &st);
+}
+
+static int commandFStat(pickle_t *i, int argc, char **argv, void *pd) {
+	UNUSED(pd);
+	if (argc != 2)
+		return error(i, "Invalid command %s -- expected file", argv[0]);
+	int fd = -1;
+	if (convert(i, argv[1], &fd) != PICKLE_OK)
+		return PICKLE_ERROR;
+	struct stat st;
+	memset(&st, 0, sizeof st);
+	errno = 0;
+	if (fstat(fd, &st) < 0)
+		return error(i, "stat on filedes '%d' failed: %s", fd, strerror(errno));
+	return statReturn(i, &st);
+}
+
+static int commandRename(pickle_t *i, int argc, char **argv, void *pd) {
+	UNUSED(pd);
+	if (argc != 3)
+		return error(i, "Invalid command %s -- expected src dst", argv[0]);
+	errno = 0;
+	const int st = rename(argv[1], argv[2]);
+	if (st < 0)
+		return error(i, "renaming file '%s' to '%s' failed: %s", argv[1], argv[2], strerror(errno));
+	return PICKLE_OK;
+}
+
+static int commandUnlink(pickle_t *i, int argc, char **argv, void *pd) {
+	UNUSED(pd);
+	if (argc != 2)
+		return error(i, "Invalid command %s -- expected path", argv[0]);
+	struct stat st;
+	memset(&st, 0, sizeof st);
+	errno = 0;
+	if (stat(argv[1], &st) < 0)
+		return error(i, "stat on file '%s' failed: %s", argv[1], strerror(errno));
+	errno = 0;
+	if (unlink(argv[1]) < 0) /* BUG: There seems to be a bug in unlink on a path that does not exist */
+		return error(i, "unlink of path '%s' failed: %s", strerror(errno));
+	return PICKLE_OK;
+}
+
+static int commandLink(pickle_t *i, int argc, char **argv, void *pd) {
+	UNUSED(pd);
+	if (argc != 3)
+		return error(i, "Invalid command %s -- expected path path", argv[0]);
+	errno = 0;
+	if (link(argv[1], argv[2]) < 0)
+		return error(i, "link '%s' '%s' failed: %s", strerror(errno));
+	return PICKLE_OK;
+}
+
+/* BUG: Does not work - causes system to crash */
+static inline int commandUtime(pickle_t *i, int argc, char **argv, void *pd) {
+	UNUSED(pd);
+	if (argc != 4)
+		return error(i, "Invalid command %s -- expected path time(s) time(s)", argv[0]);
+	int actime = 0, modtime = 0;
+	if (convert(i, argv[2], &actime) != PICKLE_OK)
+		return PICKLE_ERROR;
+	if (convert(i, argv[3], &modtime) != PICKLE_OK)
+		return PICKLE_ERROR;
+	struct utimbuf u = { .actime = actime, .modtime = modtime };
+	errno = 0;
+	if (utime(argv[1], &u) < 0)
+		return error(i, "Setting time to acc=%d mod=%d on file '%s' failed: %s", actime, modtime, strerror(errno));
+	return PICKLE_OK;
+}
+
+static int commandDf(pickle_t *i, int argc, char **argv, void *pd) {
+	if (argc != 1 && argc != 2)
+		return error(i, "Invalid command %s -- partition-number?", argv[0]);
+	int partitions = 0, r = PICKLE_OK, which = -1;
+	if (argc == 2)
+		if (convert(i, argv[1], &which) != PICKLE_OK)
+			return PICKLE_ERROR;
+	esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, NULL);
+	for (; it != NULL; it = esp_partition_next(it)) {
+		if (partitions++ == which) {
+			const esp_partition_t *p = esp_partition_get(it);
+			r = ok(i, "%s %d %d %d %d %d", p->label, (int)p->type, (int)p->subtype, (int)p->address, (int)p->size, (int)p->encrypted);
+			break;
+		}
+	}
+	esp_partition_iterator_release(it);
+	return argc == 1 ? ok(i, "%d", partitions) : r;
+}
+
 /* ======================= ESP32 Specific Functions ======================= */
 
 /* ======================= Pickle Shell Setup       ======================= */
@@ -715,6 +978,21 @@ static int make_a_pickle(pickle_t **ret, heap_t *h, FILE *in, FILE *out) {
 		{ "linenoise", commandLinenoise,  NULL,  },
 		{ "random",    commandRandom,     NULL,  },
 		{ "ota",       commandOta,        NULL,  },
+		{ "errno",     commandErrno,      NULL,  },
+
+		{ "open",      commandOpen,       NULL,  },
+		{ "close",     commandClose,      NULL,  },
+		{ "read",      commandRead,       NULL,  },
+		{ "write",     commandWrite,      NULL,  },
+		{ "seek",      commandSeek,       NULL,  },
+		{ "stat",      commandStat,       NULL,  },
+		{ "fstat",     commandFStat,      NULL,  },
+		{ "frename",   commandRename,     NULL,  },
+		{ "unlink",    commandUnlink,     NULL,  },
+		{ "link",      commandLink,       NULL,  },
+		//{ "utime",     commandUtime,      NULL,  },
+
+		{ "df",        commandDf,         NULL,  },
 	};
 
 	for (size_t j = 0; j < sizeof (cmds) / sizeof (cmds[0]); j++)
@@ -803,7 +1081,7 @@ fail:
 static void nvs_initialize(void) {
 	esp_err_t err = nvs_flash_init();
 	if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-		ESP_ERROR_CHECK( nvs_flash_erase() );
+		ESP_ERROR_CHECK(nvs_flash_erase());
 		err = nvs_flash_init();
 	}
 	ESP_ERROR_CHECK(err);
@@ -819,6 +1097,7 @@ static wl_handle_t fs_initialize(const char *base_path) {
 		.format_if_mount_failed = true,
 		.allocation_unit_size   = CONFIG_WL_SECTOR_SIZE
 	};
+	/* "storage" comes from the name in 'partitions_pickle.csv' */
 	esp_err_t err = esp_vfs_fat_spiflash_mount(base_path, "storage", &mount_config, &handle);
 	if (err != ESP_OK) {
 		ESP_LOGE(TAG, "Failed to mount FATFS (%s)", esp_err_to_name(err));
@@ -836,9 +1115,38 @@ static void fs_deinitialize(const char *base_path, wl_handle_t handle) {
 
 static const char *base_path = "/spiflash";
 
+static void file_example(void) {
+	ESP_LOGI(TAG, "Opening file");
+	FILE *f = fopen("/spiflash/hello.txt", "wb");
+	if (f == NULL) {
+		ESP_LOGE(TAG, "Failed to open file for writing");
+		return;
+	}
+	fprintf(f, "written using ESP-IDF %s\n", esp_get_idf_version());
+	fclose(f);
+	ESP_LOGI(TAG, "File written");
+
+	ESP_LOGI(TAG, "Reading file");
+	f = fopen("/spiflash/hello.txt", "rb");
+	if (f == NULL) {
+		ESP_LOGE(TAG, "Failed to open file for reading");
+		return;
+	}
+	char line[128];
+	fgets(line, sizeof(line), f);
+	fclose(f);
+	char *pos = strchr(line, '\n');
+	if (pos) {
+		*pos = '\0';
+	}
+	ESP_LOGI(TAG, "Read from file: '%s'", line);
+}
+
 void app_main(void) {
 	nvs_initialize();
 	wl_handle_t h = fs_initialize(base_path);
+	if (0)
+		file_example();
 	ESP_LOGI(TAG, "Pickle Shell: How do you like these pickles?");
 	pickle_shell();
 	ESP_LOGI(TAG, "Restarting now.");
